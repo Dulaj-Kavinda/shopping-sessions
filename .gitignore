@@ -1,0 +1,6 @@
+dev/
+out/
+*.o
+/pipeline
+.DS_Store
+__pycache__/
