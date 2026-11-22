@@ -1,10 +1,11 @@
 // Shopping Sessions: native pipeline.
 //
 // Layout of the run (T worker threads, all phases parallel):
-//   phase 1  mmap every CSV, split into ~1 MB line-aligned chunks and parse them.
-//            Events are radix-scattered by event_id hash, valid clicks are kept
-//            per thread. Thread 0 builds the linked-ID union-find, thread 1 the
-//            product table, both before joining the chunk pool.
+//   phase 1  mmap every CSV, split into ~1 MB line-aligned chunks and parse them
+//            with a SIMD structural scanner. Events are radix-scattered by
+//            event_id hash, valid clicks are kept per thread. Thread 0 builds
+//            the linked-ID union-find, thread 1 the product table (clicks are
+//            parsed first so event chunks never wait on it).
 //   phase 2  per event_id partition: dedup (smallest ingest_ts wins), keep the
 //            valid winners, map user -> person, scatter by person hash.
 //            Clicks are mapped user -> person and scattered the same way.
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -572,6 +574,13 @@ struct Buckets {
     }
   }
   inline size_t size(u32 p) const { return cnt[p] + over[p].size(); }
+  // give the pages back now (in parallel) instead of at process exit
+  void release() {
+#ifdef MADV_DONTNEED
+    if (base) madvise(base, (size_t)P * cap * sizeof(T), MADV_DONTNEED);
+#endif
+    for (u32 p = 0; p < P; p++) std::vector<T>().swap(over[p]);
+  }
   template <class F>
   inline void each(u32 p, F&& f) {
     T* b = base + (size_t)p * cap;
@@ -855,8 +864,6 @@ static u32 g_ncat, g_unknown_cat;
 // linked ids
 static KTable g_link;  // id -> index
 static std::vector<Key> g_link_pkey;
-static std::vector<const char*> g_link_nptr;
-static std::vector<u32> g_link_nlen;
 
 // hot-path map: linked user key -> person key (only ids that are not their
 // person's name). 32-byte slots, key (0,0) marks empty (never a real id).
@@ -995,31 +1002,76 @@ static void build_campaigns() {
   g_ncamp = (u32)g_camp_id.size();
 }
 
-static void build_products() {
-  MFile f = map_file(g_data + "/products.csv");
-  g_prod.init(f.size / 12 + 16);
-  KTable cats;
-  cats.init(64);
-  for_lines(f, 0, f.size, [&](const char* p, const char* e) {
+// Products are built by all threads together before parsing: each takes a
+// line-aligned slice and inserts lock-free (product ids are unique; a slot is
+// claimed by CAS on its occupied flag and only read after the barrier).
+// Category 0 is "unknown"; others are interned under a small mutex.
+static MFile g_prod_file;
+static std::mutex g_cat_mu;
+
+static void build_products_init() {
+  g_prod_file = map_file(g_data + "/products.csv");
+  size_t lines = 1;
+  const char* p = g_prod_file.data;
+  const char* e = p + g_prod_file.size;
+  while ((p = (const char*)memchr(p, '\n', (size_t)(e - p))) != nullptr) {
+    lines++;
+    p++;
+  }
+  g_prod.init(lines + 16);
+  g_cat.push_back("unknown");
+  g_unknown_cat = 0;
+}
+
+static void build_products_part(int tid) {
+  const MFile& f = g_prod_file;
+  size_t b = f.size * (size_t)tid / (size_t)T, e = f.size * (size_t)(tid + 1) / (size_t)T;
+  if (b >= e) return;
+  std::vector<std::pair<Key, u32>> local;
+  for_lines(f, b, e, [&](const char* p, const char* le) {
     const char* fs[2];
     u32 fl[2];
-    if (!tokenize(p, e, 2, fs, fl) || fl[0] == 0) return;
-    bool ins;
-    auto* c = cats.upsert(make_key(fs[1], fl[1]), ins);
-    if (ins) {
-      c->val = (u32)g_cat.size();
-      g_cat.emplace_back(fs[1], fl[1]);
+    if (!tokenize(p, le, 2, fs, fl) || fl[0] == 0) return;
+    Key ck = make_key(fs[1], fl[1]);
+    u32 ci = 0;
+    bool found = false;
+    for (auto& x : local)
+      if (key_eq(x.first, ck)) {
+        ci = x.second;
+        found = true;
+        break;
+      }
+    if (!found) {
+      std::lock_guard<std::mutex> g(g_cat_mu);
+      std::string nm(fs[1], fl[1]);
+      u32 i = 1;
+      for (; i < g_cat.size(); i++)
+        if (g_cat[i] == nm) break;
+      if (i == g_cat.size()) g_cat.push_back(nm);
+      ci = i;
+      local.push_back({ck, ci});
     }
-    u32 ci = c->val;
-    auto* s = g_prod.upsert(make_key(fs[0], fl[0]), ins);
-    if (ins) s->val = ci;
+    Key k = make_key(fs[0], fl[0]);
+    u64 i = hkey(k) & g_prod.mask;
+    for (;;) {
+      KTable::Slot* x = &g_prod.s[i];
+      u32 z = 0;
+      if (__atomic_compare_exchange_n(&x->occ, &z, 1u, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        x->lo = k.lo;
+        x->hi = k.hi;
+        x->val = ci;
+        break;
+      }
+      i = (i + 1) & g_prod.mask;
+    }
   });
+}
+
+static void build_category_ranks() {
   g_ncat = (u32)g_cat.size();
-  g_unknown_cat = g_ncat;
-  g_cat.push_back("unknown");
   std::vector<u32> order(g_cat.size());
   for (u32 i = 0; i < order.size(); i++) order[i] = i;
-  std::sort(order.begin(), order.end(), [](u32 a, u32 b) { return g_cat[a] < g_cat[b]; });
+  std::sort(order.begin(), order.end(), [](u32 x, u32 y) { return g_cat[x] < g_cat[y]; });
   g_cat_rank.assign(g_cat.size(), 0);
   for (u32 r = 0; r < order.size(); r++) g_cat_rank[order[r]] = r;
 }
@@ -1079,12 +1131,8 @@ static void build_links() {
     if (str_less(ids[i].p, ids[i].n, ids[b].p, ids[b].n)) best[r] = (u32)i;
   }
   g_link_pkey.resize(n);
-  g_link_nptr.resize(n);
-  g_link_nlen.resize(n);
   for (size_t i = 0; i < n; i++) {
     u32 b = best[find((u32)i)];
-    g_link_nptr[i] = ids[b].p;
-    g_link_nlen[i] = ids[b].n;
     g_link_pkey[i] = make_key(ids[b].p, ids[b].n);
     if (b == i && ids[b].n > 15) g_link_long.push_back(NameRef{ids[b].p, ids[b].n});
   }
@@ -1144,7 +1192,6 @@ static inline NameRef key_name(const Key& k, char* buf16) {
   return g_long_ref[g_long.find(k)->val];
 }
 
-static std::atomic<bool> g_prod_ready{false};
 
 // ---------------------------------------------------------------------------
 // phase 1: parsing
@@ -1566,25 +1613,25 @@ static void write_campaign() {
 // worker
 
 static u32 g_e_cap, g_c_cap, g_p_cap;
+static size_t g_click_reserve = 1024;
 
 static void worker(int tid) {
   TState& ts = g_ts[tid];
   ts.ebk.init(P1, g_e_cap);
-  ts.clicks.reserve(1024);
+  ts.clicks.reserve(g_click_reserve);
+
+  // phase 0: products (shared by all threads)
+  build_products_part(tid);
+  g_bar.wait();
 
   // phase 1
   if (tid == 0) build_links();
-  if (tid == (T > 1 ? 1 : 0)) {
-    build_products();
-    g_prod_ready.store(true, std::memory_order_release);
-  }
+
   for (;;) {
     u32 ci = g_chunk_next.fetch_add(1, std::memory_order_relaxed);
     if (ci >= g_chunks.size()) break;
     const Chunk& c = g_chunks[ci];
     if (c.kind == 0) {
-      if (UNLIKELY(!g_prod_ready.load(std::memory_order_acquire)))
-        while (!g_prod_ready.load(std::memory_order_acquire)) sched_yield();
       const MFile& f = g_ev_files[c.file];
       scan_chunk<7>(f, c.b, c.e, [&](const char** fs, const u32* fl) { parse_event_line(ts, fs, fl); });
     } else {
@@ -1598,7 +1645,10 @@ static void worker(int tid) {
   if (tid == 0) tmark("phase1 parse");
 
   // phase 2: dedup by event_id partition
-  if (tid == 0) build_long_names();
+  if (tid == 0) {
+    build_long_names();
+    build_category_ranks();
+  }
   {
     std::vector<ERec*> tab;
     std::vector<ERec*> win;
@@ -1676,6 +1726,8 @@ static void worker(int tid) {
   }
   g_bar.wait();
   if (tid == 0) tmark("phase2 dedup+scatter");
+  ts.ebk.release();
+  std::vector<CRec0>().swap(ts.clicks);
 
   // phase 3: per person partition
   {
@@ -1705,6 +1757,8 @@ static void worker(int tid) {
     snprintf(b, sizeof b, "phase3 done t%d", tid);
     tmark(b);
   }
+  g_bar.wait();
+  if (tid == 0) write_campaign();
   if (tid == 0 || !ts.urows.empty()) write_user_part(ts, tid);
 }
 
@@ -1739,6 +1793,7 @@ int main() {
   if (g_ndays < 1) g_ndays = 1;
 
   build_campaigns();
+  build_products_init();
 
   std::vector<std::string> evn = list_csv(g_data + "/events");
   std::vector<std::string> ckn = list_csv(g_data + "/clicks");
@@ -1775,6 +1830,7 @@ int main() {
   g_e_cap = (u32)(est_events * 3 / 2 / ((u64)T * P1) + 64);
   g_p_cap = g_e_cap;
   g_c_cap = (u32)(est_clicks * 3 / 2 / ((u64)T * P2) + 64);
+  g_click_reserve = (size_t)(est_clicks * 3 / 2 / (u64)T + 1024);
 
   mkdir((g_out + "/user_daily").c_str(), 0755);
   mkdir((g_out + "/campaign_daily").c_str(), 0755);
@@ -1786,8 +1842,6 @@ int main() {
   for (int t = 1; t < T; t++) th.emplace_back(worker, t);
   worker(0);
   for (auto& x : th) x.join();
-  tmark("joined");
-  write_campaign();
   tmark("end");
   return 0;
 }
