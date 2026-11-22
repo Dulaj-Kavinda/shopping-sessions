@@ -403,6 +403,173 @@ struct Scan {
   inline char at(const char* q) const { return q == fend ? '\n' : *q; }
 };
 
+// ---------------------------------------------------------------------------
+// Block tokenizer: per 64 bytes, masks of ',', '"' and '\n' give quote
+// validity for the whole block at once. With q = quote bits and
+// px = prefix-xor(q) (1 inside a quoted region), a line is well-formed iff
+// every opening quote (q & px) is at a field start, every closing quote
+// (q & ~px) is followed by a separator, and no separator lies inside quotes.
+// Lines are then split by walking only the separator bits. Any line that
+// fails restarts the quote parity at the next line.
+
+#if defined(__AVX2__)
+static inline void masks3(const char* p, u64& c, u64& q, u64& n) {
+  __m256i a = _mm256_loadu_si256((const __m256i*)p);
+  __m256i b = _mm256_loadu_si256((const __m256i*)(p + 32));
+  const __m256i vc = _mm256_set1_epi8(','), vq = _mm256_set1_epi8('"'), vn = _mm256_set1_epi8('\n');
+  c = (u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vc)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vc)) << 32);
+  q = (u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vq)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vq)) << 32);
+  n = (u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vn)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vn)) << 32);
+}
+#elif defined(__SSE2__)
+static inline void masks3(const char* p, u64& c, u64& q, u64& n) {
+  const __m128i vc = _mm_set1_epi8(','), vq = _mm_set1_epi8('"'), vn = _mm_set1_epi8('\n');
+  c = q = n = 0;
+  for (int i = 0; i < 4; i++) {
+    __m128i a = _mm_loadu_si128((const __m128i*)(p + 16 * i));
+    c |= (u64)(u32)_mm_movemask_epi8(_mm_cmpeq_epi8(a, vc)) << (16 * i);
+    q |= (u64)(u32)_mm_movemask_epi8(_mm_cmpeq_epi8(a, vq)) << (16 * i);
+    n |= (u64)(u32)_mm_movemask_epi8(_mm_cmpeq_epi8(a, vn)) << (16 * i);
+  }
+}
+#elif defined(__ARM_NEON)
+static inline u64 neon_bits(uint8x16_t m0, uint8x16_t m1, uint8x16_t m2, uint8x16_t m3) {
+  static const uint8_t bits[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+  const uint8x16_t bm = vld1q_u8(bits);
+  uint8x16_t s0 = vpaddq_u8(vandq_u8(m0, bm), vandq_u8(m1, bm));
+  uint8x16_t s1 = vpaddq_u8(vandq_u8(m2, bm), vandq_u8(m3, bm));
+  s0 = vpaddq_u8(s0, s1);
+  s0 = vpaddq_u8(s0, s0);
+  return vgetq_lane_u64(vreinterpretq_u64_u8(s0), 0);
+}
+static inline void masks3(const char* p, u64& c, u64& q, u64& n) {
+  uint8x16_t a0 = vld1q_u8((const uint8_t*)p), a1 = vld1q_u8((const uint8_t*)p + 16);
+  uint8x16_t a2 = vld1q_u8((const uint8_t*)p + 32), a3 = vld1q_u8((const uint8_t*)p + 48);
+  const uint8x16_t vc = vdupq_n_u8(','), vq = vdupq_n_u8('"'), vn = vdupq_n_u8('\n');
+  c = neon_bits(vceqq_u8(a0, vc), vceqq_u8(a1, vc), vceqq_u8(a2, vc), vceqq_u8(a3, vc));
+  q = neon_bits(vceqq_u8(a0, vq), vceqq_u8(a1, vq), vceqq_u8(a2, vq), vceqq_u8(a3, vq));
+  n = neon_bits(vceqq_u8(a0, vn), vceqq_u8(a1, vn), vceqq_u8(a2, vn), vceqq_u8(a3, vn));
+}
+#else
+static inline void masks3(const char* p, u64& c, u64& q, u64& n) {
+  c = q = n = 0;
+  for (int i = 0; i < 64; i++) {
+    char ch = p[i];
+    c |= (u64)(ch == ',') << i;
+    q |= (u64)(ch == '"') << i;
+    n |= (u64)(ch == '\n') << i;
+  }
+}
+#endif
+
+static inline u64 prefix_xor(u64 x) {
+  x ^= x << 1;
+  x ^= x << 2;
+  x ^= x << 4;
+  x ^= x << 8;
+  x ^= x << 16;
+  x ^= x << 32;
+  return x;
+}
+
+struct Scan2 {
+  const char* blk;
+  const char* fend;
+  u64 rem;   // separator bits not yet consumed
+  u64 nl;    // newline bits (incl. a virtual one at end of data)
+  u64 bad;   // quote-rule violations
+  u64 pxc;   // quote parity carried into the next block (0 or ~0)
+  u64 sepc;  // previous block ended with a separator
+  u64 clc;   // previous block ended with a closing quote
+  inline void load(const char* p, bool line_start) {
+    u64 c, q, n;
+    masks3(p, c, q, n);
+    if (UNLIKELY(p + 64 > fend)) {
+      size_t r = (size_t)(fend - p);
+      u64 keep = r ? (~0ULL >> (64 - r)) : 0;
+      c &= keep;
+      q &= keep;
+      n = (n & keep) | (1ULL << r);
+    }
+    if (line_start) {
+      pxc = 0;
+      sepc = 1;
+      clc = 0;
+    }
+    u64 sep = c | n;
+    u64 px = prefix_xor(q) ^ pxc;
+    pxc = (u64)((i64)px >> 63);
+    u64 S = (sep << 1) | sepc;
+    sepc = sep >> 63;
+    u64 open = q & px, close = q & ~px;
+    u64 b = (open & ~S) | (px & sep) | ((close << 1) & ~sep);
+    if (clc && !(sep & 1)) b |= 1;
+    clc = close >> 63;
+    blk = p;
+    rem = sep;
+    nl = n;
+    bad = b;
+  }
+  inline void next_block() { load(blk + 64, false); }
+};
+
+static inline u64 bits_from(unsigned a) { return ~0ULL << a; }
+static inline u64 bits_upto(unsigned b) { return b >= 63 ? ~0ULL : ((2ULL << b) - 1); }
+
+template <int NF, class F>
+static inline void scan_range2(const char* p, const char* cend, const char* fend, bool skip_first, F&& fn) {
+  if (skip_first) {
+    const char* nl = (const char*)memchr(p, '\n', (size_t)(fend - p));
+    if (!nl) return;
+    p = nl + 1;
+  }
+  if (p >= cend) return;
+  Scan2 sc;
+  sc.fend = fend;
+  sc.load(p, true);
+  const char* fs[NF];
+  u32 fl[NF];
+  while (p < cend) {
+    while (p >= sc.blk + 64) sc.next_block();
+    unsigned sb = (unsigned)(p - sc.blk);
+    const char* s = p;
+    int k = 0;
+    u64 lbad = 0;
+    const char* q;
+    for (;;) {
+      while (UNLIKELY(sc.rem == 0)) {
+        lbad |= sc.bad & bits_from(sb);
+        sc.next_block();
+        sb = 0;
+      }
+      unsigned bit = (unsigned)__builtin_ctzll(sc.rem);
+      sc.rem &= sc.rem - 1;
+      q = sc.blk + bit;
+      if (LIKELY(k < NF)) {
+        fs[k] = s;
+        fl[k] = (u32)(q - s);
+      }
+      k++;
+      if ((sc.nl >> bit) & 1) {
+        lbad |= sc.bad & bits_from(sb) & bits_upto(bit);
+        break;
+      }
+      s = q + 1;
+    }
+    p = q + 1;
+    if (LIKELY(k == NF && !lbad)) {
+      for (int i = 0; i < NF; i++)
+        if (fl[i] && *fs[i] == '"') {
+          fs[i]++;
+          fl[i] -= 2;
+        }
+      fn(fs, fl);
+    } else if (p < cend) {
+      sc.load(p, true);  // malformed: restart quote parity at the next line
+    }
+  }
+}
+
 // Tokenize one line starting at s. Returns the terminator position ('\n' or
 // end of file). ok tells whether the line is well-formed with NF fields.
 template <int NF>
@@ -494,19 +661,30 @@ static void* vm_map(size_t bytes, bool populate) {
   return p;
 }
 
-// populate an already reserved range in place
-static void vm_populate(void* p, size_t bytes) {
-  if (!bytes) return;
-  uintptr_t a = (uintptr_t)p & ~(uintptr_t)(g_page - 1);
-  uintptr_t e = ((uintptr_t)p + bytes + g_page - 1) & ~(uintptr_t)(g_page - 1);
-  void* r = mmap((void*)a, e - a, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_POPULATE, -1, 0);
-  if (r == MAP_FAILED) {
-    perror("mmap populate");
+static inline void* zalloc(size_t bytes) { return vm_map(bytes, true); }  // zeroed
+
+// Large lazily-faulted region backed by transparent huge pages where the
+// kernel allows it: 2 MB faults instead of 4 KB ones, and far fewer TLB misses.
+static bool g_use_thp = false;  // SS_THP=1 enables: risk of compaction stalls
+static void* vm_huge(size_t bytes) {
+  const size_t H = 2u << 20;
+  size_t sz = (bytes + H - 1) / H * H + H;
+  char* p = (char*)mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON
+#ifdef MAP_NORESERVE
+                                                                 | MAP_NORESERVE
+#endif
+                        ,
+                        -1, 0);
+  if (p == MAP_FAILED) {
+    perror("mmap huge");
     exit(1);
   }
+  char* a = (char*)(((uintptr_t)p + H - 1) & ~(uintptr_t)(H - 1));
+#ifdef MADV_HUGEPAGE
+  if (g_use_thp) madvise(a, sz - (size_t)(a - p), MADV_HUGEPAGE);
+#endif
+  return a;
 }
-
-static inline void* zalloc(size_t bytes) { return vm_map(bytes, true); }  // zeroed
 
 // Global operator new: per-thread bump allocation from pre-populated chunks
 // (256 KB growing to 16 MB). delete is a no-op: the process is short-lived and
@@ -525,15 +703,14 @@ static void* bump_alloc(size_t n, size_t align) {
   if (UNLIKELY(!a.cur || c + n > (uintptr_t)a.end)) {
     size_t want = n + align;
     if (want >= (4u << 20)) {  // big blocks get their own mapping
-      size_t sz = (want + 4095) & ~(size_t)4095;
-      char* p = (char*)mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_POPULATE, -1, 0);
-      if (p == MAP_FAILED) throw std::bad_alloc();
+      char* p = (char*)vm_huge(want);
       return (void*)(((uintptr_t)p + (align - 1)) & ~(uintptr_t)(align - 1));
     }
     size_t sz = a.next;
     while (sz < want) sz <<= 1;
     if (a.next < (16u << 20)) a.next <<= 1;
-    char* p = (char*)mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_POPULATE, -1, 0);
+    char* p = sz >= (4u << 20) ? (char*)vm_huge(sz)
+                               : (char*)mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) throw std::bad_alloc();
     a.cur = p;
     a.end = p + sz;
@@ -654,16 +831,11 @@ struct Parts {
   void init(u32 P_, size_t cap_) {
     P = P_;
     cap = (cap_ + BLK - 1) / BLK * BLK;
-    base = (T*)vm_map((size_t)P * cap * sizeof(T), false);
+    base = (T*)vm_huge((size_t)P * cap * sizeof(T));
     used = new Ctr[P];
   }
   // each thread populates its share of the region (called by all n threads)
-  void populate(int tid, int n) {
-    size_t total = (size_t)P * cap * sizeof(T);
-    size_t pages = (total + g_page - 1) / g_page;
-    size_t a = pages * (size_t)tid / (size_t)n, e = pages * (size_t)(tid + 1) / (size_t)n;
-    if (e > a) vm_populate((char*)base + a * g_page, std::min(total, e * g_page) - a * g_page);
-  }
+  void populate(int, int) {}  // regions fault in lazily (huge pages)
   inline size_t filled(u32 p) const { return std::min(used[p].v.load(std::memory_order_relaxed), cap); }
   size_t size(u32 p) const;
   template <class F>
@@ -1502,7 +1674,12 @@ static inline bool cl_less(const Cl& a, const Cl& b) {
   return cid_less(b, a);  // click_id descending
 }
 
+struct E16 {
+  u32 ts, price, cat, pidx;
+};
+
 struct Scratch {
+  std::vector<E16> ea, eb;
   std::vector<u32> ptab;  // person table: index+1, 0 empty
   std::vector<Key> pkeys;
   std::vector<PInfo> pinfo;
@@ -1518,23 +1695,8 @@ struct Scratch {
 };
 
 static void process_person(TState& ts, Scratch& sc, const PInfo& pi) {
-  Ev* ev = sc.ev.data() + pi.eoff;
+  Ev* ev = sc.ev.data() + pi.eoff;  // already in ts order
   u32 n = pi.ecnt;
-  if (n > 1) {
-    if (n <= 24) {
-      for (u32 i = 1; i < n; i++) {
-        Ev x = ev[i];
-        u32 j = i;
-        while (j > 0 && ev[j - 1].ts > x.ts) {
-          ev[j] = ev[j - 1];
-          j--;
-        }
-        ev[j] = x;
-      }
-    } else {
-      std::sort(ev, ev + n, [](const Ev& a, const Ev& b) { return a.ts < b.ts; });
-    }
-  }
   Cl* cl = sc.cl.data() + pi.coff;
   u32 m = pi.ccnt;
   if (m > 1) std::sort(cl, cl + m, cl_less);
@@ -1684,11 +1846,40 @@ static void process_partition(TState& ts, Scratch& sc, u32 p) {
     off += sc.pinfo[q].ecnt;
     sc.pinfo[q].ecnt = 0;
   }
-  sc.ev.resize(n);
-  for (u32 i = 0; i < n; i++) {
-    PInfo& pi = sc.pinfo[sc.evp[i]];
-    PRec& r = *sc.prs[i];
-    sc.ev[pi.eoff + pi.ecnt++] = Ev{r.ts, r.price, r.cat};
+  // LSD radix sort of the partition by ts (3 x 11 bits), then one stable
+  // counting pass by person: each person's events end up in ts order.
+  sc.ea.resize(n);
+  sc.eb.resize(n);
+  {
+    E16* A = sc.ea.data();
+    E16* B = sc.eb.data();
+    u32 h0[2048] = {0}, h1[2048] = {0}, h2[2048] = {0};
+    for (u32 i = 0; i < n; i++) {
+      const PRec& r = *sc.prs[i];
+      A[i] = E16{r.ts, r.price, r.cat, sc.evp[i]};
+      h0[r.ts & 2047]++;
+      h1[(r.ts >> 11) & 2047]++;
+      h2[r.ts >> 22]++;
+    }
+    auto pass = [&](E16* src, E16* dst, u32* h, unsigned sh) {
+      u32 sum = 0;
+      for (int d = 0; d < 2048; d++) {
+        u32 c = h[d];
+        h[d] = sum;
+        sum += c;
+      }
+      for (u32 i = 0; i < n; i++) dst[h[(src[i].ts >> sh) & 2047]++] = src[i];
+    };
+    pass(A, B, h0, 0);
+    pass(B, A, h1, 11);
+    pass(A, B, h2, 22);
+    sc.ev.resize(n);
+    Ev* ev = sc.ev.data();
+    for (u32 i = 0; i < n; i++) {
+      const E16& x = B[i];
+      PInfo& pi = sc.pinfo[x.pidx];
+      ev[pi.eoff + pi.ecnt++] = Ev{x.ts, x.price, x.cat};
+    }
   }
   // clicks of persons with events
   sc.crs.clear();
@@ -1827,6 +2018,8 @@ static void open_rfile(RFile& f) {
 
 static void setup_chunks();
 
+static bool g_tok_old = false;
+
 struct RBuf {
   char* p = nullptr;
   size_t cap = 0;
@@ -1858,7 +2051,10 @@ static void process_chunk(RBuf& rb, const RFile& f, size_t b, size_t e, F&& fn) 
       }
     }
     bool skip_first = (b == 0) || base[0] != '\n';
-    scan_range<NF>(base + (b - lo), base + (e - lo), fend, skip_first, fn);
+    if (g_tok_old)
+      scan_range<NF>(base + (b - lo), base + (e - lo), fend, skip_first, fn);
+    else
+      scan_range2<NF>(base + (b - lo), base + (e - lo), fend, skip_first, fn);
     return;
   }
 }
@@ -1931,58 +2127,90 @@ static void worker(int tid) {
     build_category_ranks();
   }
   {
-    std::vector<ERec*> tab;
+    std::vector<u64> tab;  // (tag << 32) | (index + 1), 0 = empty
+    std::vector<std::pair<ERec*, size_t>> segs;
     std::vector<ERec*> win;
-    enum { BATCH = 32 };
-    u64 bh[BATCH];
+    enum { PF = 48 };
+    std::vector<u64> hs;
     const bool links = g_has_lmap;
     for (;;) {
       u32 p = g_p2_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= P1) break;
-      size_t n = 0;
-      n = g_E.size(p);
+      // the partition as segments: its region, then any spill vectors
+      segs.clear();
+      size_t n = g_E.filled(p);
+      if (n) segs.push_back({g_E.base + (size_t)p * g_E.cap, n});
+      for (auto* w : g_E.writers)
+        if (!w->over[p].empty()) {
+          segs.push_back({w->over[p].data(), w->over[p].size()});
+          n += w->over[p].size();
+        }
       if (!n) continue;
+      auto at = [&](size_t i) -> ERec& {
+        for (auto& sg : segs) {
+          if (i < sg.second) return sg.first[i];
+          i -= sg.second;
+        }
+        __builtin_unreachable();
+      };
       size_t cap = 16;
       while (cap < n * 2) cap <<= 1;
       if (tab.size() < cap) tab.resize(cap);
-      std::fill(tab.begin(), tab.begin() + cap, nullptr);
-      u64 mask = cap - 1;
-      g_E.each(p, [&](ERec& r) {
-          u64 h = hkey(Key{r.klo, r.khi}) & mask;
+      std::fill(tab.begin(), tab.begin() + cap, 0);
+      const u64 mask = cap - 1;
+      // pass 1: sequential; the table holds a 32-bit tag, so records are
+      // only touched again on a tag match. The losing copy is marked invalid.
+      size_t idx = 0;
+      for (auto& sg : segs) {
+        ERec* rs = sg.first;
+        for (size_t j = 0; j < sg.second; j++, idx++) {
+          ERec& r = rs[j];
+          if ((r.klo | r.khi) == 0) continue;  // unused slot
+          u64 h = hkey(Key{r.klo, r.khi});
+          u64 tag = (h >> 24) & 0xFFFFFFFFULL;
+          u64 sl = h & mask;
           for (;;) {
-            ERec* s = tab[h];
-            if (!s) {
-              tab[h] = &r;
-              return;
+            u64 v = tab[sl];
+            if (!v) {
+              tab[sl] = (tag << 32) | (idx + 1);
+              break;
             }
-            if (s->klo == r.klo && s->khi == r.khi) {
-              if (r.ingest < s->ingest) tab[h] = &r;
-              return;
+            if ((v >> 32) == tag) {
+              ERec& o = at((size_t)(v & 0xFFFFFFFFULL) - 1);
+              if (o.klo == r.klo && o.khi == r.khi) {
+                if (r.ingest < o.ingest) {
+                  o.ulo = o.uhi = 0;
+                  tab[sl] = (tag << 32) | (idx + 1);
+                } else {
+                  r.ulo = r.uhi = 0;
+                }
+                break;
+              }
             }
-            h = (h + 1) & mask;
+            sl = (sl + 1) & mask;
           }
-        });
-      // valid winners: map user -> person in prefetched batches, scatter
-      win.clear();
-      for (size_t i = 0; i < cap; i++) {
-        ERec* r = tab[i];
-        if (r && (r->ulo | r->uhi)) win.push_back(r);
+        }
       }
+      // pass 2: sequential emit of valid winners, person lookups prefetched
+      win.clear();
+      for (auto& sg : segs)
+        for (size_t j = 0; j < sg.second; j++) {
+          ERec* r = &sg.first[j];
+          if (r->ulo | r->uhi) win.push_back(r);
+        }
       const size_t nw = win.size();
-      for (size_t b = 0; b < nw; b += BATCH) {
-        size_t e = std::min(nw, b + BATCH);
-        for (size_t k = b; k < e; k++) {
-          u64 h = hkey(Key{win[k]->ulo, win[k]->uhi});
-          bh[k - b] = h;
-          if (links) __builtin_prefetch(&g_lmap[h & g_lmask]);
-        }
-        for (size_t k = b; k < e; k++) {
-          const ERec* r = win[k];
-          Key pk{r->ulo, r->uhi};
-          u64 ph = bh[k - b];
-          if (links && lmap_find(pk, ph, pk)) ph = hkey(pk);
-          ts.pw.push((u32)(ph >> (64 - P2BITS)), PRec{pk.lo, pk.hi, r->ts, r->price, r->cat, 0});
-        }
+      hs.resize(nw);
+      for (size_t k = 0; k < nw; k++) hs[k] = hkey(Key{win[k]->ulo, win[k]->uhi});
+      // rolling prefetch of the person map, PF lookups ahead
+      if (links)
+        for (size_t k = 0; k < std::min(nw, (size_t)PF); k++) __builtin_prefetch(&g_lmap[hs[k] & g_lmask]);
+      for (size_t k = 0; k < nw; k++) {
+        if (links && k + PF < nw) __builtin_prefetch(&g_lmap[hs[k + PF] & g_lmask]);
+        const ERec* r = win[k];
+        Key pk{r->ulo, r->uhi};
+        u64 ph = hs[k];
+        if (links && lmap_find(pk, ph, pk)) ph = hkey(pk);
+        ts.pw.push((u32)(ph >> (64 - P2BITS)), PRec{pk.lo, pk.hi, r->ts, r->price, r->cat, 0});
       }
     }
     {
@@ -1998,20 +2226,17 @@ static void worker(int tid) {
         for (auto* w : g_C0.writers)
           for (auto& v : w->over[0]) cl.push_back(&v);
       const size_t nc = cl.size();
-      for (size_t b = 0; b < nc; b += BATCH) {
-        size_t e2 = std::min(nc, b + BATCH);
-        for (size_t k = b; k < e2; k++) {
-          u64 h = hkey(Key{cl[k]->ulo, cl[k]->uhi});
-          bh[k - b] = h;
-          if (links) __builtin_prefetch(&g_lmap[h & g_lmask]);
-        }
-        for (size_t k = b; k < e2; k++) {
-          const CRec0& c = *cl[k];
-          Key pk{c.ulo, c.uhi};
-          u64 ph = bh[k - b];
-          if (links && lmap_find(pk, ph, pk)) ph = hkey(pk);
-          ts.qw.push((u32)(ph >> (64 - P2BITS)), CRec{pk.lo, pk.hi, c.clo, c.chi, c.cptr, c.ts, c.camp});
-        }
+      hs.resize(nc);
+      for (size_t k = 0; k < nc; k++) hs[k] = hkey(Key{cl[k]->ulo, cl[k]->uhi});
+      if (links)
+        for (size_t k = 0; k < std::min(nc, (size_t)PF); k++) __builtin_prefetch(&g_lmap[hs[k] & g_lmask]);
+      for (size_t k = 0; k < nc; k++) {
+        if (links && k + PF < nc) __builtin_prefetch(&g_lmap[hs[k + PF] & g_lmask]);
+        const CRec0& c = *cl[k];
+        Key pk{c.ulo, c.uhi};
+        u64 ph = hs[k];
+        if (links && lmap_find(pk, ph, pk)) ph = hkey(pk);
+        ts.qw.push((u32)(ph >> (64 - P2BITS)), CRec{pk.lo, pk.hi, c.clo, c.chi, c.cptr, c.ts, c.camp});
       }
     }
   }
@@ -2088,6 +2313,8 @@ static void setup_chunks() {
 int main() {
   g_t0 = std::chrono::steady_clock::now();
   g_timing = getenv("SS_TIMING") != nullptr;
+  g_tok_old = getenv("SS_TOK_OLD") != nullptr;
+  if (getenv("SS_THP")) g_use_thp = true;
   g_page = (size_t)sysconf(_SC_PAGESIZE);
   const char* dd = getenv("DATA_DIR");
   const char* od = getenv("OUTPUT_DIR");

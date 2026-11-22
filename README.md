@@ -33,10 +33,17 @@ All phases run on `NCPU` threads with dynamic work distribution.
    - Phase 1 runs 2 × `NCPU` threads so that reads overlap parsing. The later
      phases use `NCPU` threads, and all barriers sleep in the kernel after a
      short spin, so a waiting thread never takes CPU from a working one.
-   - A SIMD scanner (AVX2 on x86, NEON on ARM) builds a 64-bit mask of `,`,
-     `"` and `\n` for each 64 bytes. The tokenizer walks those bits and checks
-     the rules' quoting and field-count rules exactly. A missing newline at
-     the end of a file counts as a line end, and `\r` stays ordinary data.
+   - A SIMD block tokenizer (AVX2 on x86, NEON on ARM) builds 64-bit masks of
+     `,`, `"` and `\n` for each 64 bytes. It checks quoting for the whole
+     block with bit arithmetic: with q the quote bits and px = prefix-xor(q),
+     a line is valid only if
+     - every opening quote (q & px) is at a field start,
+     - every closing quote is followed by a separator, and
+     - no separator falls inside quotes.
+
+     Lines are then split by walking only the separator bits. A malformed line
+     restarts the quote parity at the next line. A missing newline at the end
+     of a file counts as a line end, and `\r` stays ordinary data.
    - Timestamps use a per-thread cache of the last valid `YYYY-MM-DD`, so most
      F1/F2 values skip calendar validation and conversion.
    - Event copies are radix-scattered by an `event_id` hash into 48-byte
@@ -45,13 +52,18 @@ All phases run on `NCPU` threads with dynamic work distribution.
    - Clicks are parsed first, then events.
    - While the others parse, thread 0 builds the union-find over `links/`,
      naming each person by the byte-wise smallest ID.
-3. **Phase 2: dedup.** Each `event_id` partition is deduplicated in an
-   L2-sized table that keeps the copy with the smallest `ingest_ts`. A copy is
+3. **Phase 2: dedup.** Each `event_id` partition is deduplicated in two
+   sequential passes. The first probes a compact table of 32-bit tag + index
+   and only touches a record again when the tag matches; the losing copy is
+   marked in place. The second streams out the winners. The copy with the
+   smallest `ingest_ts` is kept. A copy is
    validated only if it wins, so dedup comes before validation as the rules
    require. Winners and clicks are mapped user → person through a compact
    prefetched map, then scattered by person hash.
 4. **Phase 3: sessions.**
-   - Each person partition groups events by person and sorts them by `ts`.
+   - Each person partition is radix-sorted by `ts` (3 passes of 11 bits),
+     then split by person with one stable counting pass, so each person's
+     events come out in time order without comparison sorts.
      A new session starts after a gap of more than 30 minutes.
    - Clicks are sorted by `(ts, click_id desc)`. A sliding 7-day window gives
      the crediting click: the latest one, with the smallest `click_id` on a
