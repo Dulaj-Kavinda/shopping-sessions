@@ -529,44 +529,61 @@ static inline void scan_range2(const char* p, const char* cend, const char* fend
   sc.load(p, true);
   const char* fs[NF];
   u32 fl[NF];
+  const char* pos[NF];
   while (p < cend) {
     while (p >= sc.blk + 64) sc.next_block();
     unsigned sb = (unsigned)(p - sc.blk);
     const char* s = p;
-    int k = 0;
-    u64 lbad = 0;
-    const char* q;
-    for (;;) {
+    u64 lbad = 0, nlpat = 0;
+    bool ran_out = false;
+    // fast path: take exactly NF separators; validate once at the end
+    for (int k = 0; k < NF; k++) {
       while (UNLIKELY(sc.rem == 0)) {
         lbad |= sc.bad & bits_from(sb);
+        if (sc.blk + 64 >= sc.fend) {
+          ran_out = true;
+          break;
+        }
         sc.next_block();
         sb = 0;
       }
+      if (UNLIKELY(ran_out)) break;
       unsigned bit = (unsigned)__builtin_ctzll(sc.rem);
       sc.rem &= sc.rem - 1;
-      q = sc.blk + bit;
-      if (LIKELY(k < NF)) {
-        fs[k] = s;
-        fl[k] = (u32)(q - s);
-      }
-      k++;
-      if ((sc.nl >> bit) & 1) {
-        lbad |= sc.bad & bits_from(sb) & bits_upto(bit);
-        break;
-      }
+      const char* q = sc.blk + bit;
+      pos[k] = q;
+      fs[k] = s;
+      fl[k] = (u32)(q - s);
       s = q + 1;
+      nlpat = (nlpat << 1) | ((sc.nl >> bit) & 1);
+      if (k == NF - 1) lbad |= sc.bad & bits_from(sb) & bits_upto(bit);
     }
-    p = q + 1;
-    if (LIKELY(k == NF && !lbad)) {
-      for (int i = 0; i < NF; i++)
-        if (fl[i] && *fs[i] == '"') {
-          fs[i]++;
-          fl[i] -= 2;
-        }
+    if (LIKELY(!ran_out && nlpat == 1 && !lbad)) {
+      for (int i = 0; i < NF; i++) {  // branch-free unquoting (valid line)
+        u32 qd = (u32)(*fs[i] == '"') & (u32)(fl[i] != 0);
+        fs[i] += qd;
+        fl[i] -= 2 * qd;
+      }
       fn(fs, fl);
-    } else if (p < cend) {
-      sc.load(p, true);  // malformed: restart quote parity at the next line
+      p = pos[NF - 1] + 1;
+      continue;
     }
+    // malformed line: locate its real end, then restart the quote parity
+    const char* le = nullptr;
+    if (!ran_out) {
+      int taken = NF;
+      for (int k = 0; k < taken; k++)
+        if ((nlpat >> (taken - 1 - k)) & 1) {
+          le = pos[k];
+          break;
+        }
+    }
+    if (!le) {
+      const char* nl = (const char*)memchr(p, '\n', (size_t)(fend - p));
+      le = nl ? nl : fend;
+    }
+    p = le + 1;
+    if (p < cend) sc.load(p, true);
   }
 }
 
@@ -685,6 +702,8 @@ static void* vm_huge(size_t bytes) {
 #endif
   return a;
 }
+
+
 
 // Global operator new: per-thread bump allocation from pre-populated chunks
 // (256 KB growing to 16 MB). delete is a no-op: the process is short-lived and
@@ -835,7 +854,17 @@ struct Parts {
     used = new Ctr[P];
   }
   // each thread populates its share of the region (called by all n threads)
-  void populate(int, int) {}  // regions fault in lazily (huge pages)
+  void populate(int, int) {}  // regions fault in lazily
+  // return this thread's slice of the region to the kernel (parallel
+  // teardown instead of a serial one at process exit)
+  void release(int tid, int n) {
+    size_t total = (size_t)P * cap * sizeof(T);
+    size_t pages = (total + g_page - 1) / g_page;
+    size_t a = pages * (size_t)tid / (size_t)n, e = pages * (size_t)(tid + 1) / (size_t)n;
+#ifdef MADV_DONTNEED
+    if (e > a) madvise((char*)base + a * g_page, (e - a) * g_page, MADV_DONTNEED);
+#endif
+  }
   inline size_t filled(u32 p) const { return std::min(used[p].v.load(std::memory_order_relaxed), cap); }
   size_t size(u32 p) const;
   template <class F>
@@ -1027,14 +1056,33 @@ struct PCol {
   bool optional;
   int conv;     // converted type or -1
   int logical;  // LogicalType union field id or -1
-  OBuf data;    // page body (levels + values)
+  OBuf data;    // page body (levels + values, or bit width + indices)
   i64 offset = 0, total = 0;
+  bool dict = false;  // dictionary-encoded: dpage holds the PLAIN dictionary
+  OBuf dpage;
+  i32 ndict = 0;
+  i64 data_off = 0;
 };
 
 static void write_parquet(const std::string& path, i64 nrows, std::vector<PCol>& cols) {
   OBuf f;
   f.put("PAR1", 4);
   for (auto& c : cols) {
+    c.offset = (i64)f.b.size();
+    if (c.dict) {  // DICTIONARY_PAGE, PLAIN values
+      OBuf h;
+      TC t(h);
+      t.i32f(1, 2);
+      t.i32f(2, (i32)c.dpage.b.size());
+      t.i32f(3, (i32)c.dpage.b.size());
+      t.sbeg(7);
+      t.i32f(1, c.ndict);
+      t.i32f(2, 0);
+      t.send();
+      t.stop();
+      f.put(h.b.data(), h.b.size());
+      f.put(c.dpage.b.data(), c.dpage.b.size());
+    }
     OBuf h;
     TC t(h);
     t.i32f(1, 0);
@@ -1042,15 +1090,15 @@ static void write_parquet(const std::string& path, i64 nrows, std::vector<PCol>&
     t.i32f(3, (i32)c.data.b.size());
     t.sbeg(5);
     t.i32f(1, (i32)nrows);
-    t.i32f(2, 0);
+    t.i32f(2, c.dict ? 8 : 0);  // RLE_DICTIONARY or PLAIN
     t.i32f(3, 3);
     t.i32f(4, 3);
     t.send();
     t.stop();
-    c.offset = (i64)f.b.size();
+    c.data_off = (i64)f.b.size();
     f.put(h.b.data(), h.b.size());
     f.put(c.data.b.data(), c.data.b.size());
-    c.total = (i64)(h.b.size() + c.data.b.size());
+    c.total = (i64)f.b.size() - c.offset;
   }
   OBuf m;
   TC t(m);
@@ -1085,9 +1133,16 @@ static void write_parquet(const std::string& path, i64 nrows, std::vector<PCol>&
     t.i64f(2, c.offset);
     t.sbeg(3);
     t.i32f(1, c.ptype);
-    t.lbeg(2, 5, 2);
-    m.zz32(0);
-    m.zz32(3);
+    if (c.dict) {
+      t.lbeg(2, 5, 3);
+      m.zz32(0);
+      m.zz32(3);
+      m.zz32(8);
+    } else {
+      t.lbeg(2, 5, 2);
+      m.zz32(0);
+      m.zz32(3);
+    }
     t.lbeg(3, 8, 1);
     m.varint(strlen(c.name));
     m.put(c.name, strlen(c.name));
@@ -1095,7 +1150,8 @@ static void write_parquet(const std::string& path, i64 nrows, std::vector<PCol>&
     t.i64f(5, nrows);
     t.i64f(6, c.total);
     t.i64f(7, c.total);
-    t.i64f(9, c.offset);
+    t.i64f(9, c.data_off);
+    if (c.dict) t.i64f(11, c.offset);
     t.send();
     t.eend();
   }
@@ -1181,19 +1237,31 @@ static LSlot* g_lmap = nullptr;
 static u64 g_lmask = 0;
 static bool g_has_lmap = false;
 
-static inline bool lmap_find(const Key& k, u64 h, Key& pk) {
+// Map a user key to its person key in place. The first probe is resolved
+// with selects (linked / unlinked is unpredictable per event); only a real
+// collision falls into the loop.
+static inline bool lmap_map(Key& k, u64 h) {
   u64 i = h & g_lmask;
+  const LSlot& s0 = g_lmap[i];
+  bool hit = (s0.lo == k.lo) & (s0.hi == k.hi);
+  bool empty = (s0.lo | s0.hi) == 0;
+  if (LIKELY(hit | empty)) {
+    k.lo = hit ? s0.plo : k.lo;
+    k.hi = hit ? s0.phi : k.hi;
+    return hit;
+  }
   for (;;) {
+    i = (i + 1) & g_lmask;
     const LSlot& s = g_lmap[i];
     if (s.lo == k.lo && s.hi == k.hi) {
-      pk.lo = s.plo;
-      pk.hi = s.phi;
+      k.lo = s.plo;
+      k.hi = s.phi;
       return true;
     }
     if ((s.lo | s.hi) == 0) return false;
-    i = (i + 1) & g_lmask;
   }
 }
+
 
 struct RFile {
   std::string path;
@@ -1915,39 +1983,172 @@ static void process_partition(TState& ts, Scratch& sc, u32 p) {
   for (u32 q = 0; q < np; q++) process_person(ts, sc, sc.pinfo[q]);
 }
 
+static inline int bit_width(u32 maxv) {
+  int w = 1;
+  while (w < 32 && (maxv >> w) != 0) w++;
+  return w;
+}
+
+// RLE/bit-packed hybrid, all values in one bit-packed run
+static void put_bitpacked(OBuf& o, const u32* v, size_t n, int w) {
+  size_t groups = (n + 7) / 8;
+  if (!groups) return;
+  o.varint(((u64)groups << 1) | 1);
+  size_t start = o.b.size();
+  o.b.resize(start + groups * (size_t)w);
+  u8* dst = o.b.data() + start;
+  u64 acc = 0;
+  int bits = 0;
+  for (size_t i = 0, total = groups * 8; i < total; i++) {
+    acc |= (u64)(i < n ? v[i] : 0) << bits;
+    bits += w;
+    while (bits >= 8) {
+      *dst++ = (u8)acc;
+      acc >>= 8;
+      bits -= 8;
+    }
+  }
+}
+
+// RLE/bit-packed hybrid, one RLE run per run of equal values
+static void put_rle_runs(OBuf& o, const u32* v, size_t n, int w) {
+  int vb = (w + 7) / 8;
+  size_t i = 0;
+  while (i < n) {
+    size_t j = i + 1;
+    while (j < n && v[j] == v[i]) j++;
+    o.varint((u64)(j - i) << 1);
+    u32 x = v[i];
+    for (int k = 0; k < vb; k++) {
+      o.put((u8)x);
+      x >>= 8;
+    }
+    i = j;
+  }
+}
+
+// Integer column as a dictionary of its distinct values (bit-packed indices)
+// when that is compact, else PLAIN INT32.
+static void int_column(PCol& c, const std::vector<u32>& v) {
+  size_t n = v.size();
+  u32 mx = 0;
+  for (u32 x : v) mx = std::max(mx, x);
+  if (n && mx < (1u << 22)) {
+    std::vector<u32> map((size_t)mx + 1, UINT32_MAX), idx(n);
+    std::vector<u32> vals;
+    for (size_t i = 0; i < n; i++) {
+      u32& m = map[v[i]];
+      if (m == UINT32_MAX) {
+        m = (u32)vals.size();
+        vals.push_back(v[i]);
+      }
+      idx[i] = m;
+    }
+    if (vals.size() * 4 < n * 2) {  // worth it
+      c.dict = true;
+      c.ndict = (i32)vals.size();
+      for (u32 x : vals) c.dpage.le32(x);
+      int w = bit_width(vals.size() > 1 ? (u32)vals.size() - 1 : 1);
+      c.data.put((u8)w);
+      put_bitpacked(c.data, idx.data(), n, w);
+      return;
+    }
+  }
+  c.data.b.reserve(n * 4);
+  for (u32 x : v) c.data.le32(x);
+}
+
 static void write_user_part(TState& ts, int tid) {
   std::vector<PCol> cols(6);
   cols[0] = PCol{"user_id", PT_BYTE_ARRAY, false, 0, 1, {}};
   cols[1] = PCol{"day", PT_INT32, false, 6, 6, {}};
-  cols[2] = PCol{"sessions", PT_INT64, false, -1, -1, {}};
-  cols[3] = PCol{"events", PT_INT64, false, -1, -1, {}};
-  cols[4] = PCol{"revenue_cents", PT_INT64, false, -1, -1, {}};
+  cols[2] = PCol{"sessions", PT_INT32, false, -1, -1, {}};
+  cols[3] = PCol{"events", PT_INT32, false, -1, -1, {}};
+  cols[4] = PCol{"revenue_cents", PT_INT32, false, -1, -1, {}};
   cols[5] = PCol{"top_category", PT_BYTE_ARRAY, true, 0, 1, {}};
-  size_t n = ts.urows.size();
-  size_t namebytes = 0;
-  namebytes = n * 20;
-  cols[0].data.b.reserve(namebytes);
-  cols[1].data.b.reserve(n * 4);
-  for (int c = 2; c < 5; c++) cols[c].data.b.reserve(n * 8);
-  std::vector<u8> defs(n);
-  OBuf topv;
-  for (size_t i = 0; i < n; i++) {
-    const URow& r = ts.urows[i];
-    char nb[16];
-    NameRef nm = key_name(r.name, nb);
-    put_str(cols[0].data, nm.p, nm.n);
-    cols[1].data.le32((u32)r.day);
-    cols[2].data.le64(r.sessions);
-    cols[3].data.le64(r.events);
-    cols[4].data.le64(r.revenue);
-    if (r.topcat >= 0) {
-      defs[i] = 1;
-      const std::string& s = g_cat[(size_t)r.topcat];
-      put_str(topv, s.data(), (u32)s.size());
+  const size_t n = ts.urows.size();
+  const URow* R = ts.urows.data();
+
+  // user_id: rows of one person are consecutive, so the dictionary is the
+  // sequence of persons and the indices are one RLE run per person
+  {
+    PCol& c = cols[0];
+    c.dict = true;
+    std::vector<u32> idx(n);
+    u32 np = 0;
+    c.dpage.b.reserve(n * 8 + 64);
+    for (size_t i = 0; i < n; i++) {
+      if (i == 0 || R[i].name.lo != R[i - 1].name.lo || R[i].name.hi != R[i - 1].name.hi) {
+        char nb[16];
+        NameRef nm = key_name(R[i].name, nb);
+        put_str(c.dpage, nm.p, nm.n);
+        np++;
+      }
+      idx[i] = np - 1;
+    }
+    c.ndict = (i32)np;
+    int w = bit_width(np > 1 ? np - 1 : 1);
+    c.data.put((u8)w);
+    c.data.b.reserve(np * 4 + 16);
+    put_rle_runs(c.data, idx.data(), n, w);
+  }
+  // day: dictionary of all window days
+  {
+    PCol& c = cols[1];
+    c.dict = true;
+    c.ndict = g_ndays;
+    for (int d = 0; d < g_ndays; d++) c.dpage.le32((u32)(g_day0 + d));
+    std::vector<u32> idx(n);
+    for (size_t i = 0; i < n; i++) idx[i] = (u32)(R[i].day - g_day0);
+    int w = bit_width(g_ndays > 1 ? (u32)g_ndays - 1 : 1);
+    c.data.put((u8)w);
+    put_bitpacked(c.data, idx.data(), n, w);
+  }
+  {
+    std::vector<u32> v(n);
+    for (size_t i = 0; i < n; i++) v[i] = R[i].sessions;
+    int_column(cols[2], v);
+    for (size_t i = 0; i < n; i++) v[i] = R[i].events;
+    int_column(cols[3], v);
+  }
+  // revenue: INT32 when every value fits, else INT64
+  {
+    PCol& c = cols[4];
+    u64 mx = 0;
+    for (size_t i = 0; i < n; i++) mx = std::max(mx, R[i].revenue);
+    if (mx <= (u64)INT32_MAX) {
+      c.data.b.resize(n * 4);
+      u8* d = c.data.b.data();
+      for (size_t i = 0; i < n; i++) {
+        u32 x = (u32)R[i].revenue;
+        memcpy(d + i * 4, &x, 4);
+      }
+    } else {
+      c.ptype = PT_INT64;
+      c.data.b.resize(n * 8);
+      u8* d = c.data.b.data();
+      for (size_t i = 0; i < n; i++) memcpy(d + i * 8, &R[i].revenue, 8);
     }
   }
-  put_def_levels(cols[5].data, defs);
-  cols[5].data.put(topv.b.data(), topv.b.size());
+  // top_category: definition levels, then dictionary indices of non-nulls
+  {
+    PCol& c = cols[5];
+    c.dict = true;
+    c.ndict = (i32)g_cat.size();
+    for (auto& nm : g_cat) put_str(c.dpage, nm.data(), (u32)nm.size());
+    std::vector<u8> defs(n);
+    std::vector<u32> idx;
+    idx.reserve(n / 2 + 16);
+    for (size_t i = 0; i < n; i++)
+      if (R[i].topcat >= 0) {
+        defs[i] = 1;
+        idx.push_back((u32)R[i].topcat);
+      }
+    put_def_levels(c.data, defs);
+    int w = bit_width(g_cat.size() > 1 ? (u32)g_cat.size() - 1 : 1);
+    c.data.put((u8)w);
+    put_bitpacked(c.data, idx.data(), idx.size(), w);
+  }
   char name[64];
   snprintf(name, sizeof name, "/user_daily/part-%03d.parquet", tid);
   write_parquet(g_out + name, (i64)n, cols);
@@ -2019,6 +2220,7 @@ static void open_rfile(RFile& f) {
 static void setup_chunks();
 
 static bool g_tok_old = false;
+static bool g_release = false;
 
 struct RBuf {
   char* p = nullptr;
@@ -2059,6 +2261,33 @@ static void process_chunk(RBuf& rb, const RFile& f, size_t b, size_t e, F&& fn) 
   }
 }
 
+// Developer benchmark (SS_BENCH=1): parse all event files from memory on one
+// thread, three times, and print the time. Not used in normal runs.
+static void bench_parse() {
+  std::vector<MFile> fs;
+  for (auto& f : g_ev_files) fs.push_back(read_file(f.path));
+  build_products_part(0);
+  TState& ts = g_ts[0];
+  ts.ew.init(g_E);
+  const int mode = atoi(getenv("SS_BENCH"));
+  for (int rep = 0; rep < 3; rep++) {
+    for (u32 p = 0; p < g_E.P; p++) g_E.used[p].v = 0;
+    for (u32 p = 0; p < g_E.P; p++) ts.ew.left[p] = 0, ts.ew.full[p] = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    u64 sink = 0;
+    for (auto& f : fs) {
+      const char* b = f.data;
+      if (mode == 2)
+        scan_range2<7>(b, b + f.size, b + f.size, true, [&](const char** fs_, const u32* fl) { sink += fl[0] + fl[6]; });
+      else
+        scan_range2<7>(b, b + f.size, b + f.size, true, [&](const char** fs_, const u32* fl) { parse_event_line(ts, fs_, fl); });
+    }
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    fprintf(stderr, "bench mode %d rep %d: %.1f ms (sink %llu)\n", mode, rep, ms, (unsigned long long)sink);
+  }
+  exit(0);
+}
+
 static void worker(int tid) {
   TState& ts = g_ts[tid];
 
@@ -2081,6 +2310,7 @@ static void worker(int tid) {
     tmark("opened");
   }
   g_bar1.wait();
+  if (tid == 0 && getenv("SS_BENCH")) bench_parse();
   g_E.populate(tid, TP);
   g_C0.populate(tid, TP);
   ts.ew.init(g_E);
@@ -2208,8 +2438,8 @@ static void worker(int tid) {
         if (links && k + PF < nw) __builtin_prefetch(&g_lmap[hs[k + PF] & g_lmask]);
         const ERec* r = win[k];
         Key pk{r->ulo, r->uhi};
-        u64 ph = hs[k];
-        if (links && lmap_find(pk, ph, pk)) ph = hkey(pk);
+        if (links) lmap_map(pk, hs[k]);
+        u64 ph = hkey(pk);
         ts.pw.push((u32)(ph >> (64 - P2BITS)), PRec{pk.lo, pk.hi, r->ts, r->price, r->cat, 0});
       }
     }
@@ -2234,8 +2464,8 @@ static void worker(int tid) {
         if (links && k + PF < nc) __builtin_prefetch(&g_lmap[hs[k + PF] & g_lmask]);
         const CRec0& c = *cl[k];
         Key pk{c.ulo, c.uhi};
-        u64 ph = hs[k];
-        if (links && lmap_find(pk, ph, pk)) ph = hkey(pk);
+        if (links) lmap_map(pk, hs[k]);
+        u64 ph = hkey(pk);
         ts.qw.push((u32)(ph >> (64 - P2BITS)), CRec{pk.lo, pk.hi, c.clo, c.chi, c.cptr, c.ts, c.camp});
       }
     }
@@ -2274,6 +2504,12 @@ static void worker(int tid) {
   g_bar.wait();
   if (tid == 0) write_campaign();
   if (tid == 0 || !ts.urows.empty()) write_user_part(ts, tid);
+  if (g_release) {
+    g_E.release(tid, T);
+    g_C0.release(tid, T);
+    g_P.release(tid, T);
+    g_Q.release(tid, T);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2302,6 +2538,7 @@ static void setup_chunks() {
   u64 est_clicks = cbytes / 44 + 1024;
   u64 target = std::max<u64>(est_events / 4096, 64);
   P1BITS = pow2_bits(std::min<u64>(target, 1024));
+  if (const char* pb = getenv("SS_PBITS")) P1BITS = (u32)atoi(pb);
   P1 = 1u << P1BITS;
   P2BITS = P1BITS;
   P2 = P1;
@@ -2315,6 +2552,7 @@ int main() {
   g_timing = getenv("SS_TIMING") != nullptr;
   g_tok_old = getenv("SS_TOK_OLD") != nullptr;
   if (getenv("SS_THP")) g_use_thp = true;
+  if (getenv("SS_RELEASE")) g_release = true;
   g_page = (size_t)sysconf(_SC_PAGESIZE);
   const char* dd = getenv("DATA_DIR");
   const char* od = getenv("OUTPUT_DIR");
