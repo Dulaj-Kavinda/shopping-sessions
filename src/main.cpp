@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -245,6 +246,8 @@ struct MFile {
   size_t size;
 };
 
+static void* vm_map(size_t bytes, bool populate);
+
 static void read_full(int fd, char* dst, size_t len, size_t off) {
   size_t got = 0;
   while (got < len) {
@@ -270,7 +273,7 @@ static MFile read_file(const std::string& path) {
   struct stat st;
   fstat(fd, &st);
   size_t sz = (size_t)st.st_size;
-  char* buf = (char*)malloc(sz + 128);
+  char* buf = (char*)vm_map(sz + 128, true);
   read_full(fd, buf, sz, 0);
   memset(buf + sz, 0, 128);
   close(fd);
@@ -473,6 +476,88 @@ static inline void scan_range(const char* p, const char* cend, const char* fend,
 // ---------------------------------------------------------------------------
 // open addressing table Key -> u32 (single writer; concurrent readers after)
 
+// ---------------------------------------------------------------------------
+// memory: page faults can be very expensive in sandboxed runtimes, so large
+// buffers are mapped pre-populated (one call instead of a fault per page).
+
+#ifndef MAP_POPULATE
+#define MAP_POPULATE 0
+#endif
+
+static void* vm_map(size_t bytes, bool populate) {
+  if (bytes == 0) bytes = 1;
+  void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | (populate ? MAP_POPULATE : 0), -1, 0);
+  if (p == MAP_FAILED) {
+    perror("mmap anon");
+    exit(1);
+  }
+  return p;
+}
+
+// populate an already reserved range in place
+static void vm_populate(void* p, size_t bytes) {
+  if (!bytes) return;
+  uintptr_t a = (uintptr_t)p & ~(uintptr_t)(g_page - 1);
+  uintptr_t e = ((uintptr_t)p + bytes + g_page - 1) & ~(uintptr_t)(g_page - 1);
+  void* r = mmap((void*)a, e - a, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_POPULATE, -1, 0);
+  if (r == MAP_FAILED) {
+    perror("mmap populate");
+    exit(1);
+  }
+}
+
+static inline void* zalloc(size_t bytes) { return vm_map(bytes, true); }  // zeroed
+
+// Global operator new: per-thread bump allocation from pre-populated chunks
+// (256 KB growing to 16 MB). delete is a no-op: the process is short-lived and
+// every container here is sized once or grows geometrically.
+struct BumpArena {
+  char* cur = nullptr;
+  char* end = nullptr;
+  size_t next = 256 << 10;
+};
+static thread_local BumpArena t_arena;
+
+static void* bump_alloc(size_t n, size_t align) {
+  BumpArena& a = t_arena;
+  if (n == 0) n = 1;
+  uintptr_t c = ((uintptr_t)a.cur + (align - 1)) & ~(uintptr_t)(align - 1);
+  if (UNLIKELY(!a.cur || c + n > (uintptr_t)a.end)) {
+    size_t want = n + align;
+    if (want >= (4u << 20)) {  // big blocks get their own mapping
+      size_t sz = (want + 4095) & ~(size_t)4095;
+      char* p = (char*)mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_POPULATE, -1, 0);
+      if (p == MAP_FAILED) throw std::bad_alloc();
+      return (void*)(((uintptr_t)p + (align - 1)) & ~(uintptr_t)(align - 1));
+    }
+    size_t sz = a.next;
+    while (sz < want) sz <<= 1;
+    if (a.next < (16u << 20)) a.next <<= 1;
+    char* p = (char*)mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_POPULATE, -1, 0);
+    if (p == MAP_FAILED) throw std::bad_alloc();
+    a.cur = p;
+    a.end = p + sz;
+    c = ((uintptr_t)a.cur + (align - 1)) & ~(uintptr_t)(align - 1);
+  }
+  a.cur = (char*)(c + n);
+  return (void*)c;
+}
+
+void* operator new(size_t n) { return bump_alloc(n, 16); }
+void* operator new[](size_t n) { return bump_alloc(n, 16); }
+void* operator new(size_t n, std::align_val_t al) { return bump_alloc(n, std::max<size_t>(16, (size_t)al)); }
+void* operator new[](size_t n, std::align_val_t al) { return bump_alloc(n, std::max<size_t>(16, (size_t)al)); }
+void* operator new(size_t n, const std::nothrow_t&) noexcept { return bump_alloc(n, 16); }
+void* operator new[](size_t n, const std::nothrow_t&) noexcept { return bump_alloc(n, 16); }
+void operator delete(void*) noexcept {}
+void operator delete[](void*) noexcept {}
+void operator delete(void*, size_t) noexcept {}
+void operator delete[](void*, size_t) noexcept {}
+void operator delete(void*, std::align_val_t) noexcept {}
+void operator delete[](void*, std::align_val_t) noexcept {}
+void operator delete(void*, size_t, std::align_val_t) noexcept {}
+void operator delete[](void*, size_t, std::align_val_t) noexcept {}
+
 struct KTable {
   struct Slot {
     u64 lo, hi;
@@ -485,7 +570,7 @@ struct KTable {
   void init(size_t expect) {
     size_t cap = 16;
     while (cap < expect * 2) cap <<= 1;
-    s = (Slot*)calloc(cap, sizeof(Slot));
+    s = (Slot*)zalloc(cap * sizeof(Slot));
     mask = cap - 1;
     count = 0;
   }
@@ -503,7 +588,7 @@ struct KTable {
     Slot* old = s;
     u64 oc = mask + 1;
     u64 cap = oc * 2;
-    s = (Slot*)calloc(cap, sizeof(Slot));
+    s = (Slot*)zalloc(cap * sizeof(Slot));
     mask = cap - 1;
     for (u64 j = 0; j < oc; j++)
       if (old[j].occ) {
@@ -511,7 +596,7 @@ struct KTable {
         while (s[i].occ) i = (i + 1) & mask;
         s[i] = old[j];
       }
-    free(old);
+    munmap(old, oc * sizeof(Slot));
   }
   // returns slot; ins tells whether it was created (val then set by caller)
   inline Slot* upsert(const Key& k, bool& ins) {
@@ -537,60 +622,108 @@ struct KTable {
 };
 
 // ---------------------------------------------------------------------------
-// per-thread radix buckets: fixed-capacity regions plus overflow vectors
+// Radix partitions shared by all threads. Partition p owns one contiguous
+// region; writers claim BLK-record blocks with one atomic add and fill them
+// privately. Memory is zero-filled, and an all-zero key is never a real
+// record, so unfilled slots are skipped. A full region spills to per-writer
+// vectors (rare: only heavily skewed partitions).
 
-static void* big_alloc(size_t bytes) {
-  if (bytes == 0) bytes = 1;
-  void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON
-#ifdef MAP_NORESERVE
-                                                             | MAP_NORESERVE
-#endif
-                 ,
-                 -1, 0);
-  if (p == MAP_FAILED) {
-    perror("mmap anon");
-    exit(1);
-  }
-  return p;
+template <class T>
+static inline bool rec_empty(const T& r) {
+  u64 a, b;
+  memcpy(&a, &r, 8);
+  memcpy(&b, (const char*)&r + 8, 8);
+  return (a | b) == 0;
 }
 
 template <class T>
-struct Buckets {
+struct PWriter;
+
+template <class T>
+struct Parts {
+  enum { BLK = 16 };
+  struct alignas(64) Ctr {
+    std::atomic<size_t> v{0};
+  };
+  u32 P = 0;
+  size_t cap = 0;
   T* base = nullptr;
-  u32* cnt = nullptr;
-  u32 cap = 0, P = 0;
-  std::vector<T>* over = nullptr;
-  void init(u32 P_, u32 cap_) {
+  Ctr* used = nullptr;
+  std::vector<PWriter<T>*> writers;
+  std::mutex mu;
+  void init(u32 P_, size_t cap_) {
     P = P_;
-    cap = cap_;
-    base = (T*)big_alloc((size_t)P * cap * sizeof(T));
-    cnt = (u32*)calloc(P, sizeof(u32));
-    over = new std::vector<T>[P];
+    cap = (cap_ + BLK - 1) / BLK * BLK;
+    base = (T*)vm_map((size_t)P * cap * sizeof(T), false);
+    used = new Ctr[P];
+  }
+  // each thread populates its share of the region (called by all n threads)
+  void populate(int tid, int n) {
+    size_t total = (size_t)P * cap * sizeof(T);
+    size_t pages = (total + g_page - 1) / g_page;
+    size_t a = pages * (size_t)tid / (size_t)n, e = pages * (size_t)(tid + 1) / (size_t)n;
+    if (e > a) vm_populate((char*)base + a * g_page, std::min(total, e * g_page) - a * g_page);
+  }
+  inline size_t filled(u32 p) const { return std::min(used[p].v.load(std::memory_order_relaxed), cap); }
+  size_t size(u32 p) const;
+  template <class F>
+  void each(u32 p, F&& f);
+};
+
+template <class T>
+struct PWriter {
+  Parts<T>* pt = nullptr;
+  T** cur = nullptr;
+  u32* left = nullptr;
+  u8* full = nullptr;
+  std::vector<T>* over = nullptr;
+  void init(Parts<T>& parts) {
+    pt = &parts;
+    cur = new T*[parts.P]();
+    left = new u32[parts.P]();
+    full = new u8[parts.P]();
+    over = new std::vector<T>[parts.P];
+    std::lock_guard<std::mutex> g(parts.mu);
+    parts.writers.push_back(this);
   }
   inline void push(u32 p, const T& v) {
-    u32 c = cnt[p];
-    if (LIKELY(c < cap)) {
-      base[(size_t)p * cap + c] = v;
-      cnt[p] = c + 1;
-    } else {
-      over[p].push_back(v);
+    if (UNLIKELY(left[p] == 0)) {
+      if (full[p] || !refill(p)) {
+        over[p].push_back(v);
+        return;
+      }
     }
+    *cur[p]++ = v;
+    left[p]--;
   }
-  inline size_t size(u32 p) const { return cnt[p] + over[p].size(); }
-  // give the pages back now (in parallel) instead of at process exit
-  void release() {
-#ifdef MADV_DONTNEED
-    if (base) madvise(base, (size_t)P * cap * sizeof(T), MADV_DONTNEED);
-#endif
-    for (u32 p = 0; p < P; p++) std::vector<T>().swap(over[p]);
-  }
-  template <class F>
-  inline void each(u32 p, F&& f) {
-    T* b = base + (size_t)p * cap;
-    for (u32 i = 0, n = cnt[p]; i < n; i++) f(b[i]);
-    for (auto& v : over[p]) f(v);
+  bool refill(u32 p) {
+    size_t o = pt->used[p].v.fetch_add(Parts<T>::BLK, std::memory_order_relaxed);
+    if (o + Parts<T>::BLK > pt->cap) {
+      full[p] = 1;
+      return false;
+    }
+    cur[p] = pt->base + (size_t)p * pt->cap + o;
+    left[p] = Parts<T>::BLK;
+    return true;
   }
 };
+
+template <class T>
+size_t Parts<T>::size(u32 p) const {
+  size_t n = filled(p);
+  for (auto* w : writers) n += w->over[p].size();
+  return n;
+}
+
+template <class T>
+template <class F>
+void Parts<T>::each(u32 p, F&& f) {
+  T* r = base + (size_t)p * cap;
+  for (size_t i = 0, n = filled(p); i < n; i++)
+    if (!rec_empty(r[i])) f(r[i]);
+  for (auto* w : writers)
+    for (auto& v : w->over[p]) f(v);
+}
 
 // ---------------------------------------------------------------------------
 // records
@@ -964,14 +1097,19 @@ struct TState {
     return b;
   }
   std::vector<NameRef> longnames;  // user ids over 15 bytes seen in valid events
-  Buckets<ERec> ebk;
+  PWriter<ERec> ew;   // phase 1: event copies by event_id partition
+  PWriter<CRec0> cw;  // phase 1: valid clicks
   std::vector<CRec0> clicks;
-  Buckets<PRec> pbk;
-  Buckets<CRec> cbk;
+  PWriter<PRec> pw;  // phase 2: events by person partition
+  PWriter<CRec> qw;  // phase 2: clicks by person partition
   std::vector<URow> urows;
   std::vector<CStat> cstat;
 };
 static TState* g_ts;
+static Parts<ERec> g_E;
+static Parts<CRec0> g_C0;
+static Parts<PRec> g_P;
+static Parts<CRec> g_Q;
 
 // ---------------------------------------------------------------------------
 // small tables built at start
@@ -1168,8 +1306,7 @@ static void build_links() {
     size_t cap = 16;
     while (cap < nm * 2) cap <<= 1;
     void* mem = nullptr;
-    if (posix_memalign(&mem, 64, cap * sizeof(LSlot)) != 0) exit(1);
-    memset(mem, 0, cap * sizeof(LSlot));
+    mem = zalloc(cap * sizeof(LSlot));
     g_lmap = (LSlot*)mem;
     g_lmask = cap - 1;
     for (size_t i = 0; i < n; i++) {
@@ -1283,7 +1420,7 @@ static inline void parse_event_line(TState& ts, const char** fs, const u32* fl) 
       r.cat = s ? s->val : g_unknown_cat;
     }
   }
-  ts.ebk.push((u32)(hkey(k) >> (64 - P1BITS)), r);
+  ts.ew.push((u32)(hkey(k) >> (64 - P1BITS)), r);
 }
 
 static inline void parse_click_line(TState& ts, const char** fs, const u32* fl) {
@@ -1302,7 +1439,7 @@ static inline void parse_click_line(TState& ts, const char** fs, const u32* fl) 
   r.cptr = UNLIKELY(fl[0] > 15) ? ts.stash(fs[0], fl[0], true) : nullptr;
   r.ts = (u32)(t - g_cs);
   r.camp = c->val;
-  ts.clicks.push_back(r);
+  ts.cw.push(0, r);
 }
 
 // ---------------------------------------------------------------------------
@@ -1506,7 +1643,7 @@ static void process_person(TState& ts, Scratch& sc, const PInfo& pi) {
 static void process_partition(TState& ts, Scratch& sc, u32 p) {
   // gather events
   sc.prs.clear();
-  for (int t = 0; t < T; t++) g_ts[t].pbk.each(p, [&](PRec& r) { sc.prs.push_back(&r); });
+  g_P.each(p, [&](PRec& r) { sc.prs.push_back(&r); });
   u32 n = (u32)sc.prs.size();
   if (n == 0) return;
   u32 cap = 16;
@@ -1556,8 +1693,7 @@ static void process_partition(TState& ts, Scratch& sc, u32 p) {
   // clicks of persons with events
   sc.crs.clear();
   sc.clp.clear();
-  for (int t = 0; t < T; t++)
-    g_ts[t].cbk.each(p, [&](CRec& r) {
+  g_Q.each(p, [&](CRec& r) {
       Key k{r.plo, r.phi};
       u32 h = (u32)hkey(k) & mask;
       for (;;) {
@@ -1672,8 +1808,7 @@ static void write_campaign() {
 // ---------------------------------------------------------------------------
 // worker
 
-static u32 g_e_cap, g_c_cap, g_p_cap;
-static size_t g_click_reserve = 1024;
+
 
 static void open_rfile(RFile& f) {
   f.fd = open(f.path.c_str(), O_RDONLY);
@@ -1697,9 +1832,8 @@ struct RBuf {
   size_t cap = 0;
   void ensure(size_t n) {
     if (n <= cap) return;
-    free(p);
     cap = n + (n >> 2);
-    p = (char*)malloc(cap);
+    p = (char*)vm_map(cap, true);
   }
 };
 
@@ -1751,9 +1885,14 @@ static void worker(int tid) {
     tmark("opened");
   }
   g_bar1.wait();
-  ts.ebk.init(P1, g_e_cap);
-  ts.clicks.reserve(g_click_reserve);
+  g_E.populate(tid, TP);
+  g_C0.populate(tid, TP);
+  ts.ew.init(g_E);
+  ts.cw.init(g_C0);
   RBuf rbuf;
+  rbuf.cap = (1 << 20) + 16384;
+  rbuf.p = (char*)vm_map(rbuf.cap, true);
+  g_bar1.wait();  // regions populated before anyone writes
 
   // phase 1
   if (tid == 0) build_links();
@@ -1769,13 +1908,22 @@ static void worker(int tid) {
       process_chunk<4>(rbuf, g_ck_files[c.file], c.b, c.e,
                        [&](const char** fs, const u32* fl) { parse_click_line(ts, fs, fl); });
   }
-  if (tid < T) {
-    ts.pbk.init(P2, g_p_cap);
-    ts.cbk.init(P2, g_c_cap);
-  }
   g_bar1.wait();
   if (tid >= T) return;  // extra parse threads are done
-  if (tid == 0) tmark("phase1 parse");
+  if (tid == 0) {
+    tmark("phase1 parse");
+    // person partitions sized from the exact phase-1 counts
+    size_t ne = 0, nc = g_C0.size(0);
+    for (u32 p = 0; p < P1; p++) ne += g_E.size(p);
+    g_P.init(P2, ne / P2 + ne / P2 / 4 + (size_t)Parts<PRec>::BLK * T + 64);
+    g_Q.init(P2, nc / P2 + nc / P2 / 4 + (size_t)Parts<CRec>::BLK * T + 64);
+  }
+  g_bar.wait();
+  g_P.populate(tid, T);
+  g_Q.populate(tid, T);
+  ts.pw.init(g_P);
+  ts.qw.init(g_Q);
+  g_bar.wait();
 
   // phase 2: dedup by event_id partition
   if (tid == 0) {
@@ -1792,15 +1940,14 @@ static void worker(int tid) {
       u32 p = g_p2_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= P1) break;
       size_t n = 0;
-      for (int t = 0; t < TP; t++) n += g_ts[t].ebk.size(p);
+      n = g_E.size(p);
       if (!n) continue;
       size_t cap = 16;
       while (cap < n * 2) cap <<= 1;
       if (tab.size() < cap) tab.resize(cap);
       std::fill(tab.begin(), tab.begin() + cap, nullptr);
       u64 mask = cap - 1;
-      for (int t = 0; t < TP; t++)
-        g_ts[t].ebk.each(p, [&](ERec& r) {
+      g_E.each(p, [&](ERec& r) {
           u64 h = hkey(Key{r.klo, r.khi}) & mask;
           for (;;) {
             ERec* s = tab[h];
@@ -1834,36 +1981,42 @@ static void worker(int tid) {
           Key pk{r->ulo, r->uhi};
           u64 ph = bh[k - b];
           if (links && lmap_find(pk, ph, pk)) ph = hkey(pk);
-          ts.pbk.push((u32)(ph >> (64 - P2BITS)), PRec{pk.lo, pk.hi, r->ts, r->price, r->cat, 0});
+          ts.pw.push((u32)(ph >> (64 - P2BITS)), PRec{pk.lo, pk.hi, r->ts, r->price, r->cat, 0});
         }
       }
     }
-    for (int src = tid; src < TP; src += T) {
-      const std::vector<CRec0>& clicks = g_ts[src].clicks;
-      const size_t nc = clicks.size();
+    {
+      // this thread's slice of the click region (+ all spills on thread 0)
+      std::vector<const CRec0*> cl;
+      const CRec0* reg = g_C0.base;
+      size_t n = g_C0.filled(0);
+      size_t a = n * (size_t)tid / (size_t)T, e = n * (size_t)(tid + 1) / (size_t)T;
+      cl.reserve(e - a + 16);
+      for (size_t i = a; i < e; i++)
+        if (!rec_empty(reg[i])) cl.push_back(&reg[i]);
+      if (tid == 0)
+        for (auto* w : g_C0.writers)
+          for (auto& v : w->over[0]) cl.push_back(&v);
+      const size_t nc = cl.size();
       for (size_t b = 0; b < nc; b += BATCH) {
-        size_t e = std::min(nc, b + BATCH);
-        for (size_t k = b; k < e; k++) {
-          u64 h = hkey(Key{clicks[k].ulo, clicks[k].uhi});
+        size_t e2 = std::min(nc, b + BATCH);
+        for (size_t k = b; k < e2; k++) {
+          u64 h = hkey(Key{cl[k]->ulo, cl[k]->uhi});
           bh[k - b] = h;
           if (links) __builtin_prefetch(&g_lmap[h & g_lmask]);
         }
-        for (size_t k = b; k < e; k++) {
-          const CRec0& c = clicks[k];
+        for (size_t k = b; k < e2; k++) {
+          const CRec0& c = *cl[k];
           Key pk{c.ulo, c.uhi};
           u64 ph = bh[k - b];
           if (links && lmap_find(pk, ph, pk)) ph = hkey(pk);
-          ts.cbk.push((u32)(ph >> (64 - P2BITS)), CRec{pk.lo, pk.hi, c.clo, c.chi, c.cptr, c.ts, c.camp});
+          ts.qw.push((u32)(ph >> (64 - P2BITS)), CRec{pk.lo, pk.hi, c.clo, c.chi, c.cptr, c.ts, c.camp});
         }
       }
     }
   }
   g_bar.wait();
   if (tid == 0) tmark("phase2 dedup+scatter");
-  for (int src = tid; src < TP; src += T) {
-    g_ts[src].ebk.release();
-    std::vector<CRec0>().swap(g_ts[src].clicks);
-  }
 
   // phase 3: per person partition
   {
@@ -1876,7 +2029,7 @@ static void worker(int tid) {
     std::vector<std::pair<u32, u32>> order(P2);
     for (u32 p = 0; p < P2; p++) {
       size_t s = 0;
-      for (int t = 0; t < T; t++) s += g_ts[t].pbk.size(p);
+      s = g_P.size(p);
       order[p] = {(u32)s, p};
     }
     std::sort(order.begin(), order.end(), [](const std::pair<u32, u32>& a, const std::pair<u32, u32>& b) {
@@ -1920,17 +2073,16 @@ static void setup_chunks() {
     size_t sz = g_ev_files[i].size;
     for (size_t b = 0; b < sz; b += CH) g_chunks.push_back(Chunk{i, 0, b, std::min(sz, b + CH)});
   }
-  u64 est_events = ebytes / 60 + 1024;
-  u64 est_clicks = cbytes / 40 + 1024;
+  u64 est_events = ebytes / 68 + 1024;
+  u64 est_clicks = cbytes / 44 + 1024;
   u64 target = std::max<u64>(est_events / 4096, 64);
   P1BITS = pow2_bits(std::min<u64>(target, 1024));
   P1 = 1u << P1BITS;
   P2BITS = P1BITS;
   P2 = P1;
-  g_e_cap = (u32)(est_events * 3 / 2 / ((u64)TP * P1) + 64);
-  g_p_cap = g_e_cap;
-  g_c_cap = (u32)(est_clicks * 3 / 2 / ((u64)T * P2) + 64);
-  g_click_reserve = (size_t)(est_clicks * 3 / 2 / (u64)TP + 1024);
+  // event_id partitions are uniform: 20% headroom plus one open block per writer
+  g_E.init(P1, est_events / P1 + est_events / P1 / 5 + (size_t)Parts<ERec>::BLK * TP + 64);
+  g_C0.init(1, est_clicks + est_clicks / 8 + (size_t)Parts<CRec0>::BLK * TP + 64);
 }
 
 int main() {
@@ -1965,6 +2117,19 @@ int main() {
   for (auto& s : ckn) g_ck_files.push_back(RFile{s, -1, 0});
   g_ln_paths = lnn;
   g_ln_files.resize(lnn.size());
+
+  // Grow the fd table now, while single-threaded: growing it later in a
+  // multithreaded process waits for an RCU grace period (~10 ms) and blocks
+  // every concurrent open().
+  {
+    int dfd = open(g_data.c_str(), O_RDONLY);
+    if (dfd >= 0) {
+      int want = (int)(evn.size() + ckn.size() + lnn.size()) + 64;
+      int hi = dup2(dfd, want);
+      if (hi >= 0) close(hi);
+      close(dfd);
+    }
+  }
 
   mkdir((g_out + "/user_daily").c_str(), 0755);
   mkdir((g_out + "/campaign_daily").c_str(), 0755);

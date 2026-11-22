@@ -64,6 +64,19 @@ All phases run on `NCPU` threads with dynamic work distribution.
    `user_daily` part. Thread 0 merges the per-thread campaign × day counters
    and writes `campaign_daily` at the same time.
 
+**Page faults.** Sandboxed container runtimes can make each page fault cost
+tens of microseconds. All large buffers are therefore mapped pre-populated
+(`MAP_POPULATE`):
+- the radix partitions, which threads fill block by block with one atomic add
+  per 16 records;
+- the hash tables and read buffers;
+- every C++ container, through a per-thread bump `operator new`.
+
+A run takes fewer than 100 CPU page faults, against about 60k for the dev
+set before. The fd table is grown before any thread starts, because growing
+it in a multithreaded process waits for an RCU grace period and stalls every
+concurrent `open()`.
+
 IDs are compared through a 128-bit key. IDs of up to 15 bytes are packed into
 the key exactly, as their bytes plus their length, so equality is exact and the
 name can be decoded from the key. Longer IDs are hashed into a separate key
