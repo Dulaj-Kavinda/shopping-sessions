@@ -13,7 +13,7 @@ RUN set -eu; \
       arm64) ARCH="-mcpu=generic" ;; \
       *)     ARCH="" ;; \
     esac; \
-    g++ -std=c++17 -O3 $ARCH -fno-plt -fomit-frame-pointer -pthread -static \
+    g++ -std=c++20 -O3 $ARCH -fno-plt -fomit-frame-pointer -pthread -static \
         -o /pipeline /src/main.cpp; \
     strip /pipeline
 

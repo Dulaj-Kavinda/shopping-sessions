@@ -31,7 +31,7 @@ check-dev:
 
 ## Build and test without Docker (needs a C++17 compiler)
 local:
-	$(CXX) -std=c++17 -O3 -march=native -pthread -o pipeline src/main.cpp
+	$(CXX) -std=c++20 -O3 -march=native -pthread -o pipeline src/main.cpp
 
 local-fixtures: local
 	python3 scripts/run_fixtures.py fixtures -- ./pipeline

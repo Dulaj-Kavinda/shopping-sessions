@@ -1,6 +1,6 @@
 # Shopping Sessions: native C++ pipeline
 
-One C++17 source file (`src/main.cpp`) compiled into a static binary. The
+One C++20 source file (`src/main.cpp`) compiled into a static binary. The
 image is `FROM scratch` and holds only that binary, so there is no interpreter
 or dynamic loader to start. The binary reads `/data`, writes Parquet to
 `/output/user_daily/` and `/output/campaign_daily/`, and exits 0.
@@ -26,7 +26,13 @@ All phases run on `NCPU` threads with dynamic work distribution.
    lock-free table. Product IDs are unique, so a slot is claimed with a single
    CAS. Category 0 is `unknown`.
 2. **Phase 1: parse.**
-   - Every CSV is memory-mapped and cut into line-aligned ~1 MB chunks.
+   - Input files are opened in parallel, and each one gets `POSIX_FADV_WILLNEED`
+     so the kernel starts reading everything at once. Each thread reads 1 MB
+     chunks with `pread` into its own reusable buffer. There is no `mmap`, so
+     page faults can't serialize I/O on network or FUSE storage.
+   - Phase 1 runs 2 × `NCPU` threads so that reads overlap parsing. The later
+     phases use `NCPU` threads, and all barriers sleep in the kernel after a
+     short spin, so a waiting thread never takes CPU from a working one.
    - A SIMD scanner (AVX2 on x86, NEON on ARM) builds a 64-bit mask of `,`,
      `"` and `\n` for each 64 bytes. The tokenizer walks those bits and checks
      the rules' quoting and field-count rules exactly. A missing newline at

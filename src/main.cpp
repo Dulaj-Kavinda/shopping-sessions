@@ -23,10 +23,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <cerrno>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -243,7 +245,23 @@ struct MFile {
   size_t size;
 };
 
-static MFile map_file(const std::string& path) {
+static void read_full(int fd, char* dst, size_t len, size_t off) {
+  size_t got = 0;
+  while (got < len) {
+    ssize_t r = pread(fd, dst + got, len - got, (off_t)(off + got));
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      perror("pread");
+      exit(1);
+    }
+    if (r == 0) break;  // file shrank: treat the rest as absent
+    got += (size_t)r;
+  }
+  if (got < len) memset(dst + got, 0, len - got);
+}
+
+// Whole file into a heap buffer with zero padding (safe 64-byte over-reads).
+static MFile read_file(const std::string& path) {
   int fd = open(path.c_str(), O_RDONLY);
   if (fd < 0) {
     perror(path.c_str());
@@ -252,24 +270,11 @@ static MFile map_file(const std::string& path) {
   struct stat st;
   fstat(fd, &st);
   size_t sz = (size_t)st.st_size;
-  size_t mapsz = (sz + g_page - 1) / g_page * g_page + g_page;
-  void* base = mmap(nullptr, mapsz, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
-  if (base == MAP_FAILED) {
-    perror("mmap");
-    exit(1);
-  }
-  if (sz) {
-    void* r = mmap(base, sz, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
-    if (r == MAP_FAILED) {
-      perror("mmap file");
-      exit(1);
-    }
-#ifdef MADV_SEQUENTIAL
-    madvise(base, sz, MADV_SEQUENTIAL);
-#endif
-  }
+  char* buf = (char*)malloc(sz + 128);
+  read_full(fd, buf, sz, 0);
+  memset(buf + sz, 0, 128);
   close(fd);
-  return {(const char*)base, sz};
+  return {buf, sz};
 }
 
 static std::vector<std::string> list_csv(const std::string& dir) {
@@ -443,17 +448,15 @@ bad:
   return q;
 }
 
+// Parse the lines that start in [p, cend). fend is the end of valid data
+// (a virtual '\n' if reached). skip_first: p is not known to be a line start.
 template <int NF, class F>
-static inline void scan_chunk(const MFile& f, size_t b, size_t e, F&& fn) {
-  const char* base = f.data;
-  const char* fend = base + f.size;
-  const char* p = base + b;
-  if (b == 0 || base[b - 1] != '\n') {
+static inline void scan_range(const char* p, const char* cend, const char* fend, bool skip_first, F&& fn) {
+  if (skip_first) {
     const char* nl = (const char*)memchr(p, '\n', (size_t)(fend - p));
     if (!nl) return;
     p = nl + 1;
   }
-  const char* cend = base + e;
   if (p >= cend) return;
   Scan sc;
   sc.init(p, fend);
@@ -602,12 +605,11 @@ struct ERec {  // parsed event copy, scattered by event_id
 };
 
 struct CRec0 {  // valid click, per parsing thread
-  u64 ulo, uhi;  // user key
-  const char* cid;
-  u32 cidlen;
-  u32 ts;  // ms since window_start - 7 days
+  u64 ulo, uhi;      // user key
+  u64 clo, chi;      // click_id key
+  const char* cptr;  // click_id bytes, only for ids over 15 bytes
+  u32 ts;            // ms since window_start - 7 days
   u32 camp;
-  u32 pad;
 };
 
 struct PRec {  // surviving event, scattered by person
@@ -620,11 +622,10 @@ struct PRec {  // surviving event, scattered by person
 
 struct CRec {  // click, scattered by person
   u64 plo, phi;
-  const char* cid;
-  u32 cidlen;
+  u64 clo, chi;
+  const char* cptr;
   u32 ts;
   u32 camp;
-  u32 pad;
 };
 
 struct URow {
@@ -846,7 +847,8 @@ static void put_def_levels(OBuf& o, const std::vector<u8>& defs) {
 // global state
 
 static std::string g_data, g_out;
-static int T = 8;
+static int T = 8;   // compute threads (NCPU)
+static int TP = 16; // phase 0/1 threads: more than T so file reads overlap parsing
 static i64 g_ws, g_we, g_cs;  // window start/end, click window start (ms)
 static i64 g_day0;            // epoch day of window start
 static i64 g_wsmod;           // ws - day0*DAY
@@ -888,7 +890,14 @@ static inline bool lmap_find(const Key& k, u64 h, Key& pk) {
   }
 }
 
-static std::vector<MFile> g_ev_files, g_ck_files, g_ln_files;
+struct RFile {
+  std::string path;
+  int fd;
+  size_t size;
+};
+static std::vector<RFile> g_ev_files, g_ck_files;
+static std::vector<std::string> g_ln_paths;
+static std::vector<MFile> g_ln_files;
 
 struct Chunk {
   u32 file;
@@ -911,15 +920,18 @@ struct Barrier {
     if (count.fetch_add(1, std::memory_order_acq_rel) == n - 1) {
       count.store(0, std::memory_order_relaxed);
       gen.fetch_add(1, std::memory_order_release);
+      gen.notify_all();
     } else {
-      int spins = 0;
-      while (gen.load(std::memory_order_acquire) == g) {
-        if (++spins > 2000) sched_yield();
-      }
+      // brief spin, then sleep in the kernel so waiting threads never steal
+      // CPU from the ones still working
+      for (int spins = 0; spins < 4000; spins++)
+        if (gen.load(std::memory_order_acquire) != g) return;
+      while (gen.load(std::memory_order_acquire) == g) gen.wait(g, std::memory_order_acquire);
     }
   }
 };
-static Barrier g_bar;
+static Barrier g_bar;   // the T compute threads
+static Barrier g_bar1;  // all TP threads of phases 0 and 1
 
 #include <chrono>
 static bool g_timing = false;
@@ -938,6 +950,19 @@ struct NameRef {
 static std::vector<NameRef> g_link_long;  // long person names from links
 
 struct TState {
+  std::vector<std::unique_ptr<char[]>> keep;  // copies of long ids
+  const char* stash(const char* p, u32 n, bool with_len) {
+    char* b = new char[n + 4 + 16];
+    char* d = b;
+    if (with_len) {
+      memcpy(b, &n, 4);
+      d = b + 4;
+    }
+    memcpy(d, p, n);
+    memset(d + n, 0, 16);
+    keep.emplace_back(b);
+    return b;
+  }
   std::vector<NameRef> longnames;  // user ids over 15 bytes seen in valid events
   Buckets<ERec> ebk;
   std::vector<CRec0> clicks;
@@ -985,7 +1010,7 @@ static i64 manifest_ts(const std::string& js, const char* name) {
 }
 
 static void build_campaigns() {
-  MFile f = map_file(g_data + "/campaigns.csv");
+  MFile f = read_file(g_data + "/campaigns.csv");
   g_camp.init(4096);
   for_lines(f, 0, f.size, [&](const char* p, const char* e) {
     const char* fs[2];
@@ -1010,7 +1035,7 @@ static MFile g_prod_file;
 static std::mutex g_cat_mu;
 
 static void build_products_init() {
-  g_prod_file = map_file(g_data + "/products.csv");
+  g_prod_file = read_file(g_data + "/products.csv");
   size_t lines = 1;
   const char* p = g_prod_file.data;
   const char* e = p + g_prod_file.size;
@@ -1025,7 +1050,7 @@ static void build_products_init() {
 
 static void build_products_part(int tid) {
   const MFile& f = g_prod_file;
-  size_t b = f.size * (size_t)tid / (size_t)T, e = f.size * (size_t)(tid + 1) / (size_t)T;
+  size_t b = f.size * (size_t)tid / (size_t)TP, e = f.size * (size_t)(tid + 1) / (size_t)TP;
   if (b >= e) return;
   std::vector<std::pair<Key, u32>> local;
   for_lines(f, b, e, [&](const char* p, const char* le) {
@@ -1167,7 +1192,7 @@ static std::vector<NameRef> g_long_ref;
 
 static void build_long_names() {
   size_t n = g_link_long.size();
-  for (int t = 0; t < T; t++) n += g_ts[t].longnames.size();
+  for (int t = 0; t < TP; t++) n += g_ts[t].longnames.size();
   g_long.init(n + 16);
   auto add = [&](const NameRef& r) {
     bool ins;
@@ -1178,7 +1203,7 @@ static void build_long_names() {
     }
   };
   for (auto& r : g_link_long) add(r);
-  for (int t = 0; t < T; t++)
+  for (int t = 0; t < TP; t++)
     for (auto& r : g_ts[t].longnames) add(r);
 }
 
@@ -1250,7 +1275,7 @@ static inline void parse_event_line(TState& ts, const char** fs, const u32* fl) 
     Key uk = make_key(fs[1], fl[1]);
     r.ulo = uk.lo;
     r.uhi = uk.hi;
-    if (UNLIKELY(fl[1] > 15)) ts.longnames.push_back({fs[1], fl[1]});
+    if (UNLIKELY(fl[1] > 15)) ts.longnames.push_back({ts.stash(fs[1], fl[1], false), fl[1]});
     r.ts = (u32)(t - g_ws);
     r.price = price;
     if (price) {
@@ -1271,9 +1296,10 @@ static inline void parse_click_line(TState& ts, const char** fs, const u32* fl) 
   Key uk = make_key(fs[1], fl[1]);
   r.ulo = uk.lo;
   r.uhi = uk.hi;
-  r.pad = 0;
-  r.cid = fs[0];
-  r.cidlen = fl[0];
+  Key ck = make_key(fs[0], fl[0]);
+  r.clo = ck.lo;
+  r.chi = ck.hi;
+  r.cptr = UNLIKELY(fl[0] > 15) ? ts.stash(fs[0], fl[0], true) : nullptr;
   r.ts = (u32)(t - g_cs);
   r.camp = c->val;
   ts.clicks.push_back(r);
@@ -1290,8 +1316,8 @@ struct Ev {
 };
 struct Cl {
   u32 ts, camp;
-  const char* cid;
-  u32 cidlen;
+  u64 clo, chi;
+  const char* cptr;
 };
 
 struct PInfo {
@@ -1300,9 +1326,43 @@ struct PInfo {
   u32 ccnt, coff;
 };
 
+// byte-wise a < b on click_id keys (short keys hold the bytes, zero padded)
+static inline bool cid_less(const Cl& a, const Cl& b) {
+  if (LIKELY(!a.cptr && !b.cptr)) {
+    u64 x = __builtin_bswap64(a.clo), y = __builtin_bswap64(b.clo);
+    if (x != y) return x < y;
+    const u64 M = 0x00FFFFFFFFFFFFFFULL;
+    u64 xh = __builtin_bswap64(a.chi & M), yh = __builtin_bswap64(b.chi & M);
+    if (xh != yh) return xh < yh;
+    return (a.chi >> 56) < (b.chi >> 56);
+  }
+  char ba[16], bb[16];
+  const char *pa, *pb;
+  u32 la, lb;
+  if (a.cptr) {
+    pa = a.cptr + 4;
+    memcpy(&la, a.cptr, 4);
+  } else {
+    memcpy(ba, &a.clo, 8);
+    memcpy(ba + 8, &a.chi, 8);
+    pa = ba;
+    la = (u32)(a.chi >> 56);
+  }
+  if (b.cptr) {
+    pb = b.cptr + 4;
+    memcpy(&lb, b.cptr, 4);
+  } else {
+    memcpy(bb, &b.clo, 8);
+    memcpy(bb + 8, &b.chi, 8);
+    pb = bb;
+    lb = (u32)(b.chi >> 56);
+  }
+  return str_less(pa, la, pb, lb);
+}
+
 static inline bool cl_less(const Cl& a, const Cl& b) {
   if (a.ts != b.ts) return a.ts < b.ts;
-  return str_less(b.cid, b.cidlen, a.cid, a.cidlen);  // click_id descending
+  return cid_less(b, a);  // click_id descending
 }
 
 struct Scratch {
@@ -1523,7 +1583,7 @@ static void process_partition(TState& ts, Scratch& sc, u32 p) {
   for (u32 i = 0; i < mc; i++) {
     PInfo& pi = sc.pinfo[sc.clp[i]];
     CRec& r = *sc.crs[i];
-    sc.cl[pi.coff + pi.ccnt++] = Cl{r.ts, r.camp, r.cid, r.cidlen};
+    sc.cl[pi.coff + pi.ccnt++] = Cl{r.ts, r.camp, r.clo, r.chi, r.cptr};
   }
   for (u32 q = 0; q < np; q++) process_person(ts, sc, sc.pinfo[q]);
 }
@@ -1615,14 +1675,85 @@ static void write_campaign() {
 static u32 g_e_cap, g_c_cap, g_p_cap;
 static size_t g_click_reserve = 1024;
 
+static void open_rfile(RFile& f) {
+  f.fd = open(f.path.c_str(), O_RDONLY);
+  if (f.fd < 0) {
+    perror(f.path.c_str());
+    exit(1);
+  }
+  struct stat st;
+  fstat(f.fd, &st);
+  f.size = (size_t)st.st_size;
+#ifdef POSIX_FADV_SEQUENTIAL
+  posix_fadvise(f.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+  posix_fadvise(f.fd, 0, 0, POSIX_FADV_WILLNEED);  // start reading it now
+#endif
+}
+
+static void setup_chunks();
+
+struct RBuf {
+  char* p = nullptr;
+  size_t cap = 0;
+  void ensure(size_t n) {
+    if (n <= cap) return;
+    free(p);
+    cap = n + (n >> 2);
+    p = (char*)malloc(cap);
+  }
+};
+
+// Read [b-1, e + slack) of a file and parse the lines starting in [b, e).
+template <int NF, class F>
+static void process_chunk(RBuf& rb, const RFile& f, size_t b, size_t e, F&& fn) {
+  size_t lo = b ? b - 1 : 0;
+  size_t extra = 8192;
+  for (;;) {
+    size_t hi = std::min(f.size, e + extra);
+    size_t len = hi - lo;
+    rb.ensure(len + 128);
+    read_full(f.fd, rb.p, len, lo);
+    memset(rb.p + len, 0, 128);
+    const char* base = rb.p;
+    const char* fend = base + len;
+    if (hi < f.size) {
+      const char* from = base + (e - 1 - lo);
+      if (!memchr(from, '\n', (size_t)(fend - from))) {
+        extra *= 8;
+        continue;
+      }
+    }
+    bool skip_first = (b == 0) || base[0] != '\n';
+    scan_range<NF>(base + (b - lo), base + (e - lo), fend, skip_first, fn);
+    return;
+  }
+}
+
 static void worker(int tid) {
   TState& ts = g_ts[tid];
+
+  // phase 0: open inputs, read links, build products (all threads)
+  {
+    size_t ne = g_ev_files.size(), nc = g_ck_files.size(), nl = g_ln_paths.size();
+    for (size_t i = (size_t)tid; i < ne + nc + nl; i += (size_t)TP) {
+      if (i < ne)
+        open_rfile(g_ev_files[i]);
+      else if (i < ne + nc)
+        open_rfile(g_ck_files[i - ne]);
+      else
+        g_ln_files[i - ne - nc] = read_file(g_ln_paths[i - ne - nc]);
+    }
+  }
+  build_products_part(tid);
+  g_bar1.wait();
+  if (tid == 0) {
+    setup_chunks();
+    tmark("opened");
+  }
+  g_bar1.wait();
   ts.ebk.init(P1, g_e_cap);
   ts.clicks.reserve(g_click_reserve);
-
-  // phase 0: products (shared by all threads)
-  build_products_part(tid);
-  g_bar.wait();
+  RBuf rbuf;
 
   // phase 1
   if (tid == 0) build_links();
@@ -1631,17 +1762,19 @@ static void worker(int tid) {
     u32 ci = g_chunk_next.fetch_add(1, std::memory_order_relaxed);
     if (ci >= g_chunks.size()) break;
     const Chunk& c = g_chunks[ci];
-    if (c.kind == 0) {
-      const MFile& f = g_ev_files[c.file];
-      scan_chunk<7>(f, c.b, c.e, [&](const char** fs, const u32* fl) { parse_event_line(ts, fs, fl); });
-    } else {
-      const MFile& f = g_ck_files[c.file];
-      scan_chunk<4>(f, c.b, c.e, [&](const char** fs, const u32* fl) { parse_click_line(ts, fs, fl); });
-    }
+    if (c.kind == 0)
+      process_chunk<7>(rbuf, g_ev_files[c.file], c.b, c.e,
+                       [&](const char** fs, const u32* fl) { parse_event_line(ts, fs, fl); });
+    else
+      process_chunk<4>(rbuf, g_ck_files[c.file], c.b, c.e,
+                       [&](const char** fs, const u32* fl) { parse_click_line(ts, fs, fl); });
   }
-  ts.pbk.init(P2, g_p_cap);
-  ts.cbk.init(P2, g_c_cap);
-  g_bar.wait();
+  if (tid < T) {
+    ts.pbk.init(P2, g_p_cap);
+    ts.cbk.init(P2, g_c_cap);
+  }
+  g_bar1.wait();
+  if (tid >= T) return;  // extra parse threads are done
   if (tid == 0) tmark("phase1 parse");
 
   // phase 2: dedup by event_id partition
@@ -1659,14 +1792,14 @@ static void worker(int tid) {
       u32 p = g_p2_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= P1) break;
       size_t n = 0;
-      for (int t = 0; t < T; t++) n += g_ts[t].ebk.size(p);
+      for (int t = 0; t < TP; t++) n += g_ts[t].ebk.size(p);
       if (!n) continue;
       size_t cap = 16;
       while (cap < n * 2) cap <<= 1;
       if (tab.size() < cap) tab.resize(cap);
       std::fill(tab.begin(), tab.begin() + cap, nullptr);
       u64 mask = cap - 1;
-      for (int t = 0; t < T; t++)
+      for (int t = 0; t < TP; t++)
         g_ts[t].ebk.each(p, [&](ERec& r) {
           u64 h = hkey(Key{r.klo, r.khi}) & mask;
           for (;;) {
@@ -1705,29 +1838,32 @@ static void worker(int tid) {
         }
       }
     }
-    {
-      const size_t nc = ts.clicks.size();
+    for (int src = tid; src < TP; src += T) {
+      const std::vector<CRec0>& clicks = g_ts[src].clicks;
+      const size_t nc = clicks.size();
       for (size_t b = 0; b < nc; b += BATCH) {
         size_t e = std::min(nc, b + BATCH);
         for (size_t k = b; k < e; k++) {
-          u64 h = hkey(Key{ts.clicks[k].ulo, ts.clicks[k].uhi});
+          u64 h = hkey(Key{clicks[k].ulo, clicks[k].uhi});
           bh[k - b] = h;
           if (links) __builtin_prefetch(&g_lmap[h & g_lmask]);
         }
         for (size_t k = b; k < e; k++) {
-          const CRec0& c = ts.clicks[k];
+          const CRec0& c = clicks[k];
           Key pk{c.ulo, c.uhi};
           u64 ph = bh[k - b];
           if (links && lmap_find(pk, ph, pk)) ph = hkey(pk);
-          ts.cbk.push((u32)(ph >> (64 - P2BITS)), CRec{pk.lo, pk.hi, c.cid, c.cidlen, c.ts, c.camp, 0});
+          ts.cbk.push((u32)(ph >> (64 - P2BITS)), CRec{pk.lo, pk.hi, c.clo, c.chi, c.cptr, c.ts, c.camp});
         }
       }
     }
   }
   g_bar.wait();
   if (tid == 0) tmark("phase2 dedup+scatter");
-  ts.ebk.release();
-  std::vector<CRec0>().swap(ts.clicks);
+  for (int src = tid; src < TP; src += T) {
+    g_ts[src].ebk.release();
+    std::vector<CRec0>().swap(g_ts[src].clicks);
+  }
 
   // phase 3: per person partition
   {
@@ -1770,6 +1906,33 @@ static u32 pow2_bits(u64 x) {
   return b;
 }
 
+static void setup_chunks() {
+  size_t ebytes = 0, cbytes = 0;
+  for (auto& f : g_ev_files) ebytes += f.size;
+  for (auto& f : g_ck_files) cbytes += f.size;
+  const size_t CH = 1 << 20;
+  // clicks first: they need nothing; events are the bulk
+  for (u32 i = 0; i < g_ck_files.size(); i++) {
+    size_t sz = g_ck_files[i].size;
+    for (size_t b = 0; b < sz; b += CH) g_chunks.push_back(Chunk{i, 1, b, std::min(sz, b + CH)});
+  }
+  for (u32 i = 0; i < g_ev_files.size(); i++) {
+    size_t sz = g_ev_files[i].size;
+    for (size_t b = 0; b < sz; b += CH) g_chunks.push_back(Chunk{i, 0, b, std::min(sz, b + CH)});
+  }
+  u64 est_events = ebytes / 60 + 1024;
+  u64 est_clicks = cbytes / 40 + 1024;
+  u64 target = std::max<u64>(est_events / 4096, 64);
+  P1BITS = pow2_bits(std::min<u64>(target, 1024));
+  P1 = 1u << P1BITS;
+  P2BITS = P1BITS;
+  P2 = P1;
+  g_e_cap = (u32)(est_events * 3 / 2 / ((u64)TP * P1) + 64);
+  g_p_cap = g_e_cap;
+  g_c_cap = (u32)(est_clicks * 3 / 2 / ((u64)T * P2) + 64);
+  g_click_reserve = (size_t)(est_clicks * 3 / 2 / (u64)TP + 1024);
+}
+
 int main() {
   g_t0 = std::chrono::steady_clock::now();
   g_timing = getenv("SS_TIMING") != nullptr;
@@ -1798,48 +1961,24 @@ int main() {
   std::vector<std::string> evn = list_csv(g_data + "/events");
   std::vector<std::string> ckn = list_csv(g_data + "/clicks");
   std::vector<std::string> lnn = list_csv(g_data + "/links");
-  size_t ebytes = 0, cbytes = 0;
-  for (auto& s : evn) {
-    g_ev_files.push_back(map_file(s));
-    ebytes += g_ev_files.back().size;
-  }
-  for (auto& s : ckn) {
-    g_ck_files.push_back(map_file(s));
-    cbytes += g_ck_files.back().size;
-  }
-  for (auto& s : lnn) g_ln_files.push_back(map_file(s));
-
-  const size_t CH = 1 << 20;
-  for (u32 i = 0; i < g_ck_files.size(); i++) {
-    size_t sz = g_ck_files[i].size;
-    for (size_t b = 0; b < sz; b += CH) g_chunks.push_back(Chunk{i, 1, b, std::min(sz, b + CH)});
-  }
-  for (u32 i = 0; i < g_ev_files.size(); i++) {
-    size_t sz = g_ev_files[i].size;
-    for (size_t b = 0; b < sz; b += CH) g_chunks.push_back(Chunk{i, 0, b, std::min(sz, b + CH)});
-  }
-  // big chunks interleaved: keep file order but events first is fine
-
-  u64 est_events = ebytes / 60 + 1024;
-  u64 est_clicks = cbytes / 40 + 1024;
-  u64 target = std::max<u64>(est_events / 4096, 64);
-  P1BITS = pow2_bits(std::min<u64>(target, 1024));
-  P1 = 1u << P1BITS;
-  P2BITS = P1BITS;
-  P2 = P1;
-  g_e_cap = (u32)(est_events * 3 / 2 / ((u64)T * P1) + 64);
-  g_p_cap = g_e_cap;
-  g_c_cap = (u32)(est_clicks * 3 / 2 / ((u64)T * P2) + 64);
-  g_click_reserve = (size_t)(est_clicks * 3 / 2 / (u64)T + 1024);
+  for (auto& s : evn) g_ev_files.push_back(RFile{s, -1, 0});
+  for (auto& s : ckn) g_ck_files.push_back(RFile{s, -1, 0});
+  g_ln_paths = lnn;
+  g_ln_files.resize(lnn.size());
 
   mkdir((g_out + "/user_daily").c_str(), 0755);
   mkdir((g_out + "/campaign_daily").c_str(), 0755);
 
   tmark("setup");
+  const char* pt = getenv("SS_PARSE_THREADS");
+  TP = pt ? atoi(pt) : 2 * T;
+  if (TP < T) TP = T;
+  if (TP > 128) TP = 128;
   g_bar.n = T;
-  g_ts = new TState[T];
+  g_bar1.n = TP;
+  g_ts = new TState[TP];
   std::vector<std::thread> th;
-  for (int t = 1; t < T; t++) th.emplace_back(worker, t);
+  for (int t = 1; t < TP; t++) th.emplace_back(worker, t);
   worker(0);
   for (auto& x : th) x.join();
   tmark("end");
